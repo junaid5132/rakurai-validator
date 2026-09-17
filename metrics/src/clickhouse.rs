@@ -423,7 +423,16 @@ pub fn create_table_ddl(table: &str) -> Option<String> {
     `signatures` Nullable(String),\n\
     `start_timestamp_ns` Nullable(Int64),\n\
     `tip_lamports` Nullable(Int64),\n\
-    `total_cus` Nullable(Int64)\n\
+    `total_cus` Nullable(Int64),\n\
+    INDEX idx_bundle_id bundle_id TYPE bloom_filter(0.01) GRANULARITY 4,\n\
+    INDEX idx_signatures_ngram ifNull(signatures, '') TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4,\n\
+    PROJECTION proj_by_timestamp\n\
+    (\n\
+        SELECT *\n\
+        ORDER BY\n\
+            timestamp,\n\
+            host_id\n\
+    )\n\
 )\n{suffix}"
         ),
         "rakurai_tin_connection_state" => format!(
@@ -805,5 +814,21 @@ mod tests {
             assert!(ddl.contains("ENGINE = MergeTree"), "{table}");
         }
         assert!(create_table_ddl("rakurai_unknown").is_none());
+    }
+
+    #[test]
+    fn test_bundle_lifecycle_ddl_includes_indexes_and_projection() {
+        let ddl = create_table_ddl("rakurai_info_bundle_lifecycle").expect("ddl");
+        assert!(ddl.contains(
+            "INDEX idx_bundle_id bundle_id TYPE bloom_filter(0.01) GRANULARITY 4"
+        ));
+        assert!(ddl.contains(
+            "INDEX idx_signatures_ngram ifNull(signatures, '') TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4"
+        ));
+        assert!(ddl.contains("PROJECTION proj_by_timestamp"));
+        assert!(ddl.contains("timestamp,"));
+        assert!(ddl.contains("host_id"));
+        // Table ORDER BY stays (host_id, timestamp); projection is for timestamp-first reads.
+        assert!(ddl.contains("ORDER BY (host_id, timestamp)"));
     }
 }
