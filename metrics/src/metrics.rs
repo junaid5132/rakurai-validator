@@ -1,7 +1,9 @@
-//! The `metrics` module enables sending measurements to an `InfluxDB` instance
+//! The `metrics` module enables sending measurements to InfluxDB (Solana metrics)
+//! and ClickHouse (Rakurai `rakurai*` datapoints).
 
 use std::{fs::OpenOptions, io::Write as io_write};
 
+use crate::clickhouse::{self, RakuraiClickHouseConfig};
 use crate::create_datapoint;
 #[cfg(not(feature = "without_influxdb"))]
 use reqwest;
@@ -29,18 +31,18 @@ use {
     thiserror::Error,
 };
 
-/// When false, Rakurai InfluxDB submit path is not configured.
+/// When false, Rakurai ClickHouse submit path is not configured.
 /// Default true; process entrypoints may disable via CLI before the metrics agent starts.
 static RAKURAI_METRICS_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Connection params; filled by [`set_rakurai_metrics_config`] before the agent starts.
-static RAKURAI_METRICS_CONFIG: std::sync::LazyLock<RwLock<MetricsConfig>> =
-    std::sync::LazyLock::new(|| RwLock::new(MetricsConfig::default()));
+/// ClickHouse connection params; filled by [`set_rakurai_metrics_config`] before the agent starts.
+static RAKURAI_METRICS_CONFIG: std::sync::LazyLock<RwLock<RakuraiMetricsConfig>> =
+    std::sync::LazyLock::new(|| RwLock::new(RakuraiMetricsConfig::default()));
 
-/// Enable or disable writing rakurai log datapoints to the Rakurai metrics DB.
+/// Enable or disable writing rakurai log datapoints to ClickHouse.
 ///
 /// Must be called **before** the metrics agent is first used (`submit`, `flush`,
-/// `set_panic_hook`, etc.), so the agent picks up the setting when building write URLs.
+/// `set_panic_hook`, etc.), so the agent picks up the setting when building the client.
 pub fn set_rakurai_metrics_enabled(enabled: bool) {
     RAKURAI_METRICS_ENABLED.store(enabled, Ordering::SeqCst);
 }
@@ -49,15 +51,22 @@ pub fn rakurai_metrics_enabled() -> bool {
     RAKURAI_METRICS_ENABLED.load(Ordering::SeqCst)
 }
 
-/// Set the Rakurai metrics InfluxDB connection params.
+/// Set the Rakurai ClickHouse connection params.
 ///
 /// Must be called **before** the metrics agent is first used when metrics are enabled.
-pub fn set_rakurai_metrics_config(host: String, db: String, username: String, password: String) {
-    *RAKURAI_METRICS_CONFIG.write().unwrap() = MetricsConfig {
+pub fn set_rakurai_metrics_config(
+    host: String,
+    db: String,
+    username: String,
+    password: String,
+    insecure_tls: bool,
+) {
+    *RAKURAI_METRICS_CONFIG.write().unwrap() = RakuraiMetricsConfig {
         host,
         db,
         username,
         password,
+        insecure_tls,
     };
 }
 
@@ -121,7 +130,8 @@ pub trait MetricsWriter {
 struct InfluxDbMetricsWriter {
     write_url: Option<String>,
     extra_stats_write_url: Option<String>,
-    rakurai_write_url: Option<String>,
+    #[cfg(not(feature = "without_influxdb"))]
+    rakurai_clickhouse_client: Option<reqwest::blocking::Client>,
 }
 
 #[allow(dead_code)]
@@ -136,23 +146,47 @@ pub fn warning_log(msg: String) {
 
 #[allow(dead_code)]
 fn dump_to_file(msg: String) {
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true) // create if it doesn't exist
-        .append(true) // append instead of truncate
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
         .open("/var/tmp/rakurai_scheduler_abort.log")
     {
-        write!(file, "{}", msg).unwrap();
-    } else {
-        warning_log("Failed to create rakurai_scheduler_abort.log file".to_string());
+        Ok(mut file) => {
+            if let Err(err) = write!(file, "{msg}") {
+                warn!("failed writing rakurai abort log file: {err}");
+            }
+        }
+        Err(err) => {
+            warn!("failed to open rakurai_scheduler_abort.log: {err}");
+        }
     }
 }
 
 impl InfluxDbMetricsWriter {
     fn new() -> Self {
+        let rakurai_config = get_rakurai_metrics_config().ok();
+        if let Some(ref config) = rakurai_config {
+            info!(
+                "rakurai metrics configuration: host={} db={} username={} backend=clickhouse \
+                 insecure_tls={}",
+                config.host, config.db, config.username, config.insecure_tls
+            );
+        }
+        #[cfg(not(feature = "without_influxdb"))]
+        let rakurai_clickhouse_client = rakurai_config.and_then(|config| {
+            clickhouse::build_client(config.insecure_tls)
+                .map_err(|err| {
+                    warn!("rakurai ClickHouse client init failed: {err}");
+                    err
+                })
+                .ok()
+        });
+
         Self {
             write_url: Self::build_write_url().ok(),
             extra_stats_write_url: Self::build_extra_stats_write_url().ok(),
-            rakurai_write_url: Self::build_rakurai_write_url().ok(),
+            #[cfg(not(feature = "without_influxdb"))]
+            rakurai_clickhouse_client,
         }
     }
 
@@ -194,46 +228,6 @@ impl InfluxDbMetricsWriter {
 
         Ok(write_url)
     }
-
-    fn build_rakurai_write_url() -> Result<String, MetricsError> {
-        let config = get_rakurai_metrics_config().map_err(|err| {
-            info!("rakurai metrics disabled: {err}");
-            err
-        })?;
-
-        info!(
-            "rakurai metrics configuration: host={} db={} username={}",
-            config.host, config.db, config.username
-        );
-
-        let write_url = format!(
-            "{}/write?db={}&u={}&p={}&precision=n",
-            &config.host, &config.db, &config.username, &config.password
-        );
-
-        Ok(write_url)
-    }
-}
-
-// copy of build_write_url with different db name
-#[allow(dead_code)]
-fn build_extra_stats_write_url() -> Result<String, MetricsError> {
-    let config = get_metrics_config().map_err(|err| {
-        info!("metrics disabled: {}", err);
-        err
-    })?;
-
-    info!(
-        "metrics configuration: host={} db={} username={}",
-        config.host, config.db, config.username
-    );
-
-    let write_url = format!(
-        "{}/write?db={}_extra_stats&u={}&p={}&precision=n",
-        &config.host, &config.db, &config.username, &config.password
-    );
-
-    Ok(write_url)
 }
 
 fn calculate_len(len: &mut usize, point: &DataPoint, host_id: &str) {
@@ -367,14 +361,7 @@ impl MetricsWriter for InfluxDbMetricsWriter {
             }
         }
 
-        if let Some(rakurai_log_line) = rakurai_log_line {
-            if rakurai_warning_log {
-                dump_to_file(rakurai_log_line.clone());
-            }
-            if let Some(ref rakurai_write_url) = self.rakurai_write_url {
-                send_datapoints_to_db(rakurai_write_url, rakurai_log_line, true);
-            }
-        }
+        self.write_rakurai_points(&points, &host_id, rakurai_log_line, rakurai_warning_log);
     }
 }
 
@@ -397,13 +384,97 @@ impl MetricsWriter for InfluxDbMetricsWriter {
             }
         }
 
-        if let Some(rakurai_log_line) = rakurai_log_line {
-            if rakurai_warning_log {
-                dump_to_file(rakurai_log_line.clone());
+        self.write_rakurai_points(
+            &points,
+            &host_id,
+            rakurai_log_line,
+            rakurai_warning_log,
+        );
+    }
+}
+
+impl InfluxDbMetricsWriter {
+    #[cfg(feature = "without_influxdb")]
+    fn write_rakurai_points(
+        &self,
+        points: &[DataPoint],
+        _host_id: &str,
+        rakurai_log_line: Option<String>,
+        rakurai_warning_log: bool,
+    ) {
+        let has_rakurai = points.iter().any(|p| p.name.starts_with("rakurai"));
+        if !has_rakurai {
+            return;
+        }
+        if rakurai_warning_log {
+            if let Some(line) = rakurai_log_line {
+                dump_to_file(line);
             }
-            if let Some(ref rakurai_write_url) = self.rakurai_write_url {
-                send_datapoints_to_db(client, rakurai_write_url, rakurai_log_line, true);
+        }
+    }
+
+    #[cfg(not(feature = "without_influxdb"))]
+    fn write_rakurai_points(
+        &self,
+        points: &[DataPoint],
+        host_id: &str,
+        rakurai_log_line: Option<String>,
+        rakurai_warning_log: bool,
+    ) {
+        let rakurai_points: Vec<DataPoint> = points
+            .iter()
+            .filter(|p| p.name.starts_with("rakurai"))
+            .cloned()
+            .collect();
+        if rakurai_points.is_empty() {
+            return;
+        }
+
+        // Local abort log must succeed independently of ClickHouse availability.
+        if rakurai_warning_log {
+            if let Some(line) = rakurai_log_line {
+                dump_to_file(line);
             }
+        }
+
+        let Ok(config) = get_rakurai_metrics_config() else {
+            // Disabled or incomplete — do not spam; config is set once at startup.
+            return;
+        };
+
+        let Some(ref ch_client) = self.rakurai_clickhouse_client else {
+            // Client build failed at agent start; warn once so ops can see metrics are dropped.
+            static CLIENT_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+            if !CLIENT_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "rakurai ClickHouse HTTP client unavailable; dropping rakurai metrics writes \
+                     (host={} db={})",
+                    config.host, config.db
+                );
+            }
+            return;
+        };
+
+        let ch_config = RakuraiClickHouseConfig {
+            host: config.host,
+            db: config.db,
+            username: config.username,
+            password: config.password,
+        };
+
+        // Isolate ClickHouse failures from the metrics agent thread (and thus the validator).
+        let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            clickhouse::write_rakurai_points(ch_client, &ch_config, &rakurai_points, host_id);
+        }));
+        if let Err(panic_payload) = write_result {
+            warn!(
+                "rakurai ClickHouse write panicked (suppressed): {:?}",
+                panic_payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("unknown panic")
+            );
         }
     }
 }
@@ -741,7 +812,25 @@ struct MetricsConfig {
     pub password: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RakuraiMetricsConfig {
+    pub host: String,
+    pub db: String,
+    pub username: String,
+    pub password: String,
+    pub insecure_tls: bool,
+}
+
 impl MetricsConfig {
+    fn complete(&self) -> bool {
+        !(self.host.is_empty()
+            || self.db.is_empty()
+            || self.username.is_empty()
+            || self.password.is_empty())
+    }
+}
+
+impl RakuraiMetricsConfig {
     fn complete(&self) -> bool {
         !(self.host.is_empty()
             || self.db.is_empty()
@@ -779,7 +868,7 @@ fn get_metrics_config() -> Result<MetricsConfig, MetricsError> {
     Ok(config)
 }
 
-fn get_rakurai_metrics_config() -> Result<MetricsConfig, MetricsError> {
+fn get_rakurai_metrics_config() -> Result<RakuraiMetricsConfig, MetricsError> {
     if !rakurai_metrics_enabled() {
         return Err(MetricsError::RakuraiMetricsDisabled);
     }
@@ -1092,5 +1181,21 @@ mod test {
         let test_host_id = "test_host_123".to_string();
         set_host_id(test_host_id.clone());
         assert_eq!(get_host_id(), test_host_id);
+    }
+
+    #[test]
+    fn test_rakurai_metrics_config() {
+        set_rakurai_metrics_enabled(true);
+        set_rakurai_metrics_config(
+            "https://example:8443".to_string(),
+            "rakurai_stats_db".to_string(),
+            "ch_writer".to_string(),
+            "secret".to_string(),
+            true,
+        );
+        let config = get_rakurai_metrics_config().unwrap();
+        assert_eq!(config.host, "https://example:8443");
+        assert_eq!(config.db, "rakurai_stats_db");
+        assert!(config.insecure_tls);
     }
 }

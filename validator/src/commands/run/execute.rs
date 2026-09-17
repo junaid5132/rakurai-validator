@@ -119,6 +119,7 @@ pub fn execute(
     if matches.is_present("disable_rakurai_logs_db") {
         solana_metrics::set_rakurai_metrics_enabled(false);
     } else {
+        // ClickHouse HTTPS currently requires accepting the invalid/self-signed cert.
         solana_metrics::set_rakurai_metrics_config(
             matches
                 .value_of("rakurai_logs_db_host")
@@ -136,6 +137,7 @@ pub fn execute(
                 .value_of("rakurai_logs_db_password")
                 .expect("rakurai_logs_db_password has a default")
                 .to_string(),
+            true,
         );
     }
 

@@ -18,6 +18,7 @@ dist/
 **/*.rs.bk
 .cargo/*
 !.cargo/config.toml
+.cargo-cache/
 
 /config/
 

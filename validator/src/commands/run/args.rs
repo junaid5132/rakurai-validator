@@ -1164,8 +1164,8 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("rakurai-logs-db-host")
             .value_name("URL")
             .takes_value(true)
-            .default_value("https://metrics.rakurai.io:8086")
-            .help("InfluxDB host URL for Rakurai metrics / log datapoints"),
+            .default_value("https://metrics.rakurai.io:8443")
+            .help("ClickHouse HTTPS host URL for Rakurai metrics / log datapoints"),
     )
     .arg(
         Arg::with_name("rakurai_logs_db")
@@ -1173,23 +1173,23 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("DB")
             .takes_value(true)
             .default_value("rakurai_stats_db")
-            .help("InfluxDB database name for Rakurai metrics / log datapoints"),
+            .help("ClickHouse database name for Rakurai metrics / log datapoints"),
     )
     .arg(
         Arg::with_name("rakurai_logs_db_user")
             .long("rakurai-logs-db-user")
             .value_name("USERNAME")
             .takes_value(true)
-            .default_value("rakurai_stats_db_write")
-            .help("InfluxDB username for Rakurai metrics / log datapoints"),
+            .default_value("ch_writer")
+            .help("ClickHouse username for Rakurai metrics writes (INSERT-only)"),
     )
     .arg(
         Arg::with_name("rakurai_logs_db_password")
             .long("rakurai-logs-db-password")
             .value_name("PASSWORD")
             .takes_value(true)
-            .default_value("password")
-            .help("InfluxDB password for Rakurai metrics / log datapoints"),
+            .default_value("DMj9PLUNONxmktCJJJKg3QSGCL8c4D")
+            .help("ClickHouse password/key for Rakurai metrics writes"),
     )
     .arg(
         Arg::with_name("no_delay_leader_block_for_pending_fork")

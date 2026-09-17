@@ -31,6 +31,7 @@ reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip
 solana-cluster-type = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 solana-time-utils = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
