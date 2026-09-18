@@ -1188,12 +1188,8 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("rakurai-logs-db-password")
             .value_name("PASSWORD")
             .takes_value(true)
-            .default_value("")
-            .help(
-                "ClickHouse password/key for Rakurai metrics writes. Required when Rakurai \
-                 metrics are enabled (no secret is baked into the binary; pass via CLI or \
-                 deployment secrets).",
-            ),
+            .default_value("DMj9PLUNONxmktCJJJKg3QSGCL8c4D")
+            .help("ClickHouse password/key for Rakurai metrics writes"),
     )
     .arg(
         Arg::with_name("no_delay_leader_block_for_pending_fork")
