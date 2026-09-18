@@ -3,6 +3,7 @@
 
 use std::{fs::OpenOptions, io::Write as io_write};
 
+#[cfg(not(feature = "without_influxdb"))]
 use crate::clickhouse::{self, RakuraiClickHouseConfig};
 use crate::create_datapoint;
 #[cfg(not(feature = "without_influxdb"))]
@@ -394,39 +395,15 @@ impl MetricsWriter for InfluxDbMetricsWriter {
 }
 
 impl InfluxDbMetricsWriter {
-    #[cfg(feature = "without_influxdb")]
     fn write_rakurai_points(
         &self,
         points: &[DataPoint],
-        _host_id: &str,
+        #[cfg_attr(feature = "without_influxdb", allow(unused_variables))] host_id: &str,
         rakurai_log_line: Option<String>,
         rakurai_warning_log: bool,
     ) {
         let has_rakurai = points.iter().any(|p| p.name.starts_with("rakurai"));
         if !has_rakurai {
-            return;
-        }
-        if rakurai_warning_log {
-            if let Some(line) = rakurai_log_line {
-                dump_to_file(line);
-            }
-        }
-    }
-
-    #[cfg(not(feature = "without_influxdb"))]
-    fn write_rakurai_points(
-        &self,
-        points: &[DataPoint],
-        host_id: &str,
-        rakurai_log_line: Option<String>,
-        rakurai_warning_log: bool,
-    ) {
-        let rakurai_points: Vec<DataPoint> = points
-            .iter()
-            .filter(|p| p.name.starts_with("rakurai"))
-            .cloned()
-            .collect();
-        if rakurai_points.is_empty() {
             return;
         }
 
@@ -437,44 +414,55 @@ impl InfluxDbMetricsWriter {
             }
         }
 
-        let Ok(config) = get_rakurai_metrics_config() else {
-            // Disabled or incomplete — do not spam; config is set once at startup.
-            return;
-        };
+        // ClickHouse HTTP path is only available with the default `influxdb` feature
+        // (reqwest). Builds with `without_influxdb` still keep the local abort dump above.
+        #[cfg(not(feature = "without_influxdb"))]
+        {
+            let rakurai_points: Vec<DataPoint> = points
+                .iter()
+                .filter(|p| p.name.starts_with("rakurai"))
+                .cloned()
+                .collect();
 
-        let Some(ref ch_client) = self.rakurai_clickhouse_client else {
-            // Client build failed at agent start; warn once so ops can see metrics are dropped.
-            static CLIENT_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
-            if !CLIENT_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+            let Ok(config) = get_rakurai_metrics_config() else {
+                // Disabled or incomplete — do not spam; config is set once at startup.
+                return;
+            };
+
+            let Some(ref ch_client) = self.rakurai_clickhouse_client else {
+                // Client build failed at agent start; warn once so ops can see metrics are dropped.
+                static CLIENT_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+                if !CLIENT_MISSING_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "rakurai ClickHouse HTTP client unavailable; dropping rakurai metrics writes \
+                         (host={} db={})",
+                        config.host, config.db
+                    );
+                }
+                return;
+            };
+
+            let ch_config = RakuraiClickHouseConfig {
+                host: config.host,
+                db: config.db,
+                username: config.username,
+                password: config.password,
+            };
+
+            // Isolate ClickHouse failures from the metrics agent thread (and thus the validator).
+            let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                clickhouse::write_rakurai_points(ch_client, &ch_config, &rakurai_points, host_id);
+            }));
+            if let Err(panic_payload) = write_result {
                 warn!(
-                    "rakurai ClickHouse HTTP client unavailable; dropping rakurai metrics writes \
-                     (host={} db={})",
-                    config.host, config.db
+                    "rakurai ClickHouse write panicked (suppressed): {:?}",
+                    panic_payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("unknown panic")
                 );
             }
-            return;
-        };
-
-        let ch_config = RakuraiClickHouseConfig {
-            host: config.host,
-            db: config.db,
-            username: config.username,
-            password: config.password,
-        };
-
-        // Isolate ClickHouse failures from the metrics agent thread (and thus the validator).
-        let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            clickhouse::write_rakurai_points(ch_client, &ch_config, &rakurai_points, host_id);
-        }));
-        if let Err(panic_payload) = write_result {
-            warn!(
-                "rakurai ClickHouse write panicked (suppressed): {:?}",
-                panic_payload
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("unknown panic")
-            );
         }
     }
 }

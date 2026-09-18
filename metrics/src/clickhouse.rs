@@ -7,7 +7,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         sync::Mutex,
-        time::{Duration, Instant, UNIX_EPOCH},
+        time::UNIX_EPOCH,
     },
 };
 
@@ -27,7 +27,7 @@ pub const ALLOWED_TABLES: &[&str] = &[
 const MAX_ROWS_PER_INSERT: usize = 500;
 /// After a failed CREATE, wait before retrying CREATE (INSERT is still attempted).
 #[cfg(not(feature = "without_influxdb"))]
-const ENSURE_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const ENSURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Cap ClickHouse error bodies in logs.
 #[cfg(not(feature = "without_influxdb"))]
 const MAX_ERROR_BODY_CHARS: usize = 512;
@@ -503,7 +503,7 @@ pub fn create_table_ddl(table: &str) -> Option<String> {
 #[derive(Debug)]
 enum EnsureState {
     Ensured,
-    Failed { last_attempt: Instant },
+    Failed { last_attempt: std::time::Instant },
 }
 
 #[cfg(not(feature = "without_influxdb"))]
@@ -608,7 +608,7 @@ pub fn ensure_table(
                 guard.get_or_insert_with(HashMap::new).insert(
                     table.to_string(),
                     EnsureState::Failed {
-                        last_attempt: Instant::now(),
+                        last_attempt: std::time::Instant::now(),
                     },
                 );
                 false
@@ -620,7 +620,7 @@ pub fn ensure_table(
             guard.get_or_insert_with(HashMap::new).insert(
                 table.to_string(),
                 EnsureState::Failed {
-                    last_attempt: Instant::now(),
+                    last_attempt: std::time::Instant::now(),
                 },
             );
             false
