@@ -116,310 +116,173 @@ fn field_bool(fields: &ParsedFields, key: &'static str) -> Option<bool> {
     }
 }
 
-#[derive(Debug, Clone, Row, Serialize)]
-struct BundleLifecycleRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    block_engine_uuid: Option<String>,
-    bundle_id: Option<String>,
-    bundle_priority: Option<i64>,
-    drop_reason: Option<String>,
-    end_timestamp_ns: Option<i64>,
-    has_postpack_confirmation: Option<i64>,
-    is_primary: Option<i64>,
-    num_txs: Option<i64>,
-    outcome: Option<String>,
-    p2c_id: Option<String>,
-    priority_fee_lamports: Option<i64>,
-    received_slot: Option<i64>,
-    signatures: Option<String>,
-    start_timestamp_ns: Option<i64>,
-    tip_lamports: Option<i64>,
-    total_cus: Option<i64>,
-}
+/// Declares a ClickHouse row struct plus `Row::from_point(&DataPoint, host_id)`.
+/// Field syntax: `[#[rename = "col"]] name: kind = "source_key"` (`kind` is
+/// `str` | `i64` | `bool`). `timestamp`/`time_ns`/`host_id` are added for you.
+macro_rules! rakurai_row {
+    ($row:ident { $($(#[rename = $rename:literal])? $field:ident : $kind:ident = $key:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Row, Serialize)]
+        struct $row {
+            #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+            timestamp: DateTime<Utc>,
+            time_ns: u64,
+            host_id: String,
+            $($(#[serde(rename = $rename)])? $field: rakurai_row!(@ty $kind)),+
+        }
 
-#[derive(Debug, Clone, Row, Serialize)]
-struct TinConnectionStateRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    #[serde(rename = "primary")]
-    primary_conn: Option<bool>,
-    source: Option<String>,
-    state: Option<String>,
-    url: Option<String>,
-    actual_url: Option<String>,
-    uuid: Option<String>,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-struct WarningRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    rakurai_abort_log: Option<String>,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-struct InfoRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    rakurai_info_log: Option<String>,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-struct StatusRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-struct QosThroughputRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    candidate_non_singleton_count: Option<i64>,
-    candidate_singleton_count: Option<i64>,
-    dedicated_lane_dequeue_count: Option<i64>,
-    dedicated_lane_enqueue_count: Option<i64>,
-    dedicated_lane_service_max_us: Option<i64>,
-    dedicated_lane_service_us: Option<i64>,
-    ingress_ordinary: Option<i64>,
-    ingress_pruner_candidate: Option<i64>,
-    mixed_batch_count: Option<i64>,
-    ordinary_batch_count: Option<i64>,
-    ordinary_batch_max_transactions: Option<i64>,
-    ordinary_transaction_count: Option<i64>,
-    report_elapsed_us: Option<i64>,
-    s1_bounded_ordinary_dispatched_batches: Option<i64>,
-    s1_bounded_ordinary_passes: Option<i64>,
-    s1_candidate_recheck_already_processed: Option<i64>,
-    s1_candidate_recheck_blockhash_not_found: Option<i64>,
-    s1_candidate_recheck_dropped: Option<i64>,
-    s1_candidate_recheck_other: Option<i64>,
-    s1_early_ordinary_dispatched_batches: Option<i64>,
-    s1_early_ordinary_passes: Option<i64>,
-    s1_ordinary_in_flight_worker_samples: Option<i64>,
-    s1_ordinary_lock_or_admission_blocked_rounds: Option<i64>,
-    s1_ordinary_no_worker_capacity_rounds: Option<i64>,
-    s1_ordinary_queue_busy_worker_samples: Option<i64>,
-    worker_estimated_cu_total: Option<i64>,
-    worker_transaction_total: Option<i64>,
-    worker_work_total: Option<i64>,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-struct QosWorkerRow {
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    timestamp: DateTime<Utc>,
-    time_ns: u64,
-    host_id: String,
-    candidate_batches: Option<i64>,
-    enqueue_blocked_us: Option<i64>,
-    estimated_compute_units: Option<i64>,
-    estimated_cu_per_second: Option<i64>,
-    estimated_cu_share_ppm: Option<i64>,
-    max_batch_transactions: Option<i64>,
-    max_sender_queue_depth: Option<i64>,
-    ordinary_batches: Option<i64>,
-    transaction_share_ppm: Option<i64>,
-    transactions: Option<i64>,
-    transactions_per_second: Option<i64>,
-    work_batches: Option<i64>,
-    work_per_second: Option<i64>,
-    work_share_ppm: Option<i64>,
-    worker: Option<i64>,
+        impl $row {
+            fn from_point(point: &DataPoint, host_id: &str) -> Self {
+                let fields = parse_datapoint_fields(&point.fields);
+                let time_ns = point_time_ns(point);
+                let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+                Self {
+                    timestamp,
+                    time_ns,
+                    host_id,
+                    $($field: rakurai_row!(@get $kind, &fields, $key)),+
+                }
+            }
+        }
+    };
+    (@ty str) => { Option<String> };
+    (@ty i64) => { Option<i64> };
+    (@ty bool) => { Option<bool> };
+    (@get str, $fields:expr, $key:literal) => { field_string($fields, $key) };
+    (@get i64, $fields:expr, $key:literal) => { field_i64($fields, $key) };
+    (@get bool, $fields:expr, $key:literal) => { field_bool($fields, $key) };
 }
 
 fn common(host_id: &str, time_ns: u64) -> (DateTime<Utc>, u64, String) {
     (timestamp_from_nanos(time_ns), time_ns, host_id.to_string())
 }
 
-fn map_bundle_lifecycle(point: &DataPoint, host_id: &str) -> BundleLifecycleRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    BundleLifecycleRow {
-        timestamp,
-        time_ns,
-        host_id,
-        block_engine_uuid: field_string(&fields, "block_engine_uuid"),
-        bundle_id: field_string(&fields, "bundle_id"),
-        bundle_priority: field_i64(&fields, "bundle_priority"),
-        drop_reason: field_string(&fields, "drop_reason"),
-        end_timestamp_ns: field_i64(&fields, "end_timestamp_ns"),
-        has_postpack_confirmation: field_i64(&fields, "has_postpack_confirmation"),
-        is_primary: field_i64(&fields, "is_primary"),
-        num_txs: field_i64(&fields, "num_txs"),
-        outcome: field_string(&fields, "outcome"),
-        p2c_id: field_string(&fields, "p2c_id"),
-        priority_fee_lamports: field_i64(&fields, "priority_fee_lamports"),
-        received_slot: field_i64(&fields, "received_slot"),
-        signatures: field_string(&fields, "signatures"),
-        start_timestamp_ns: field_i64(&fields, "start_timestamp_ns"),
-        tip_lamports: field_i64(&fields, "tip_lamports"),
-        total_cus: field_i64(&fields, "total_cus"),
-    }
-}
+rakurai_row!(BundleLifecycleRow {
+    block_engine_uuid: str = "block_engine_uuid",
+    bundle_id: str = "bundle_id",
+    bundle_priority: i64 = "bundle_priority",
+    drop_reason: str = "drop_reason",
+    end_timestamp_ns: i64 = "end_timestamp_ns",
+    has_postpack_confirmation: i64 = "has_postpack_confirmation",
+    is_primary: i64 = "is_primary",
+    num_txs: i64 = "num_txs",
+    outcome: str = "outcome",
+    p2c_id: str = "p2c_id",
+    priority_fee_lamports: i64 = "priority_fee_lamports",
+    received_slot: i64 = "received_slot",
+    signatures: str = "signatures",
+    start_timestamp_ns: i64 = "start_timestamp_ns",
+    tip_lamports: i64 = "tip_lamports",
+    total_cus: i64 = "total_cus",
+});
 
+rakurai_row!(TinConnectionStateRow {
+    #[rename = "primary"]
+    primary_conn: bool = "primary",
+    source: str = "source",
+    state: str = "state",
+    url: str = "url",
+    actual_url: str = "actual_url",
+    uuid: str = "uuid",
+});
+
+rakurai_row!(WarningRow {
+    rakurai_abort_log: str = "rakurai_abort_log",
+});
+
+rakurai_row!(InfoRow {
+    rakurai_info_log: str = "rakurai_info_log",
+});
+
+rakurai_row!(StatusRow {
+    enabled: bool = "enabled",
+});
+
+rakurai_row!(QosThroughputRow {
+    candidate_non_singleton_count: i64 = "candidate_non_singleton_count",
+    candidate_singleton_count: i64 = "candidate_singleton_count",
+    dedicated_lane_dequeue_count: i64 = "dedicated_lane_dequeue_count",
+    dedicated_lane_enqueue_count: i64 = "dedicated_lane_enqueue_count",
+    dedicated_lane_service_max_us: i64 = "dedicated_lane_service_max_us",
+    dedicated_lane_service_us: i64 = "dedicated_lane_service_us",
+    ingress_ordinary: i64 = "ingress_ordinary",
+    ingress_pruner_candidate: i64 = "ingress_pruner_candidate",
+    mixed_batch_count: i64 = "mixed_batch_count",
+    ordinary_batch_count: i64 = "ordinary_batch_count",
+    ordinary_batch_max_transactions: i64 = "ordinary_batch_max_transactions",
+    ordinary_transaction_count: i64 = "ordinary_transaction_count",
+    report_elapsed_us: i64 = "report_elapsed_us",
+    s1_bounded_ordinary_dispatched_batches: i64 = "s1_bounded_ordinary_dispatched_batches",
+    s1_bounded_ordinary_passes: i64 = "s1_bounded_ordinary_passes",
+    s1_candidate_recheck_already_processed: i64 = "s1_candidate_recheck_already_processed",
+    s1_candidate_recheck_blockhash_not_found: i64 = "s1_candidate_recheck_blockhash_not_found",
+    s1_candidate_recheck_dropped: i64 = "s1_candidate_recheck_dropped",
+    s1_candidate_recheck_other: i64 = "s1_candidate_recheck_other",
+    s1_early_ordinary_dispatched_batches: i64 = "s1_early_ordinary_dispatched_batches",
+    s1_early_ordinary_passes: i64 = "s1_early_ordinary_passes",
+    s1_ordinary_in_flight_worker_samples: i64 = "s1_ordinary_in_flight_worker_samples",
+    s1_ordinary_lock_or_admission_blocked_rounds: i64 = "s1_ordinary_lock_or_admission_blocked_rounds",
+    s1_ordinary_no_worker_capacity_rounds: i64 = "s1_ordinary_no_worker_capacity_rounds",
+    s1_ordinary_queue_busy_worker_samples: i64 = "s1_ordinary_queue_busy_worker_samples",
+    worker_estimated_cu_total: i64 = "worker_estimated_cu_total",
+    worker_transaction_total: i64 = "worker_transaction_total",
+    worker_work_total: i64 = "worker_work_total",
+});
+
+rakurai_row!(QosWorkerRow {
+    candidate_batches: i64 = "candidate_batches",
+    enqueue_blocked_us: i64 = "enqueue_blocked_us",
+    estimated_compute_units: i64 = "estimated_compute_units",
+    estimated_cu_per_second: i64 = "estimated_cu_per_second",
+    estimated_cu_share_ppm: i64 = "estimated_cu_share_ppm",
+    max_batch_transactions: i64 = "max_batch_transactions",
+    max_sender_queue_depth: i64 = "max_sender_queue_depth",
+    ordinary_batches: i64 = "ordinary_batches",
+    transaction_share_ppm: i64 = "transaction_share_ppm",
+    transactions: i64 = "transactions",
+    transactions_per_second: i64 = "transactions_per_second",
+    work_batches: i64 = "work_batches",
+    work_per_second: i64 = "work_per_second",
+    work_share_ppm: i64 = "work_share_ppm",
+    worker: i64 = "worker",
+});
+
+rakurai_row!(P2cUpdateCountRow {
+    p2c_tpu_enabled: bool = "p2c_tpu_enabled",
+    scheduler_count: i64 = "scheduler_count",
+    slot: i64 = "slot",
+    total_count: i64 = "total_count",
+    tpu_count: i64 = "tpu_count",
+    uuid: str = "uuid",
+});
+
+rakurai_row!(P2cTotalUpdateCountRow {
+    scheduler_count: i64 = "scheduler_count",
+    slot: i64 = "slot",
+    total_count: i64 = "total_count",
+    tpu_count: i64 = "tpu_count",
+});
+
+// `rakurai_warning`/`rakurai_info` datapoints used two possible field names for
+// their message depending on the caller; fold both onto the one row column.
 fn map_warning(point: &DataPoint, host_id: &str) -> WarningRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    let abort = field_string(&fields, "rakurai_abort_log");
-    let warning = field_string(&fields, "rakurai_warning_log");
-    WarningRow {
-        timestamp,
-        time_ns,
-        host_id,
-        rakurai_abort_log: abort.or(warning),
+    let mut row = WarningRow::from_point(point, host_id);
+    if row.rakurai_abort_log.is_none() {
+        let fields = parse_datapoint_fields(&point.fields);
+        row.rakurai_abort_log = field_string(&fields, "rakurai_warning_log");
     }
+    row
 }
 
 fn map_info(point: &DataPoint, host_id: &str) -> InfoRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    let log = field_string(&fields, "rakurai_info_log").or_else(|| {
-        fields.values().find_map(|v| match v {
+    let mut row = InfoRow::from_point(point, host_id);
+    if row.rakurai_info_log.is_none() {
+        let fields = parse_datapoint_fields(&point.fields);
+        row.rakurai_info_log = fields.values().find_map(|v| match v {
             ParsedFieldValue::String(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
-        })
-    });
-    InfoRow {
-        timestamp,
-        time_ns,
-        host_id,
-        rakurai_info_log: log,
+        });
     }
-}
-
-fn map_status(point: &DataPoint, host_id: &str) -> StatusRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    StatusRow {
-        timestamp,
-        time_ns,
-        host_id,
-        enabled: field_bool(&fields, "enabled"),
-    }
-}
-
-fn map_tin(point: &DataPoint, host_id: &str) -> TinConnectionStateRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    TinConnectionStateRow {
-        timestamp,
-        time_ns,
-        host_id,
-        primary_conn: field_bool(&fields, "primary"),
-        source: field_string(&fields, "source"),
-        state: field_string(&fields, "state"),
-        url: field_string(&fields, "url"),
-        actual_url: field_string(&fields, "actual_url"),
-        uuid: field_string(&fields, "uuid"),
-    }
-}
-
-fn map_qos_throughput(point: &DataPoint, host_id: &str) -> QosThroughputRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    QosThroughputRow {
-        timestamp,
-        time_ns,
-        host_id,
-        candidate_non_singleton_count: field_i64(&fields, "candidate_non_singleton_count"),
-        candidate_singleton_count: field_i64(&fields, "candidate_singleton_count"),
-        dedicated_lane_dequeue_count: field_i64(&fields, "dedicated_lane_dequeue_count"),
-        dedicated_lane_enqueue_count: field_i64(&fields, "dedicated_lane_enqueue_count"),
-        dedicated_lane_service_max_us: field_i64(&fields, "dedicated_lane_service_max_us"),
-        dedicated_lane_service_us: field_i64(&fields, "dedicated_lane_service_us"),
-        ingress_ordinary: field_i64(&fields, "ingress_ordinary"),
-        ingress_pruner_candidate: field_i64(&fields, "ingress_pruner_candidate"),
-        mixed_batch_count: field_i64(&fields, "mixed_batch_count"),
-        ordinary_batch_count: field_i64(&fields, "ordinary_batch_count"),
-        ordinary_batch_max_transactions: field_i64(&fields, "ordinary_batch_max_transactions"),
-        ordinary_transaction_count: field_i64(&fields, "ordinary_transaction_count"),
-        report_elapsed_us: field_i64(&fields, "report_elapsed_us"),
-        s1_bounded_ordinary_dispatched_batches: field_i64(
-            &fields,
-            "s1_bounded_ordinary_dispatched_batches",
-        ),
-        s1_bounded_ordinary_passes: field_i64(&fields, "s1_bounded_ordinary_passes"),
-        s1_candidate_recheck_already_processed: field_i64(
-            &fields,
-            "s1_candidate_recheck_already_processed",
-        ),
-        s1_candidate_recheck_blockhash_not_found: field_i64(
-            &fields,
-            "s1_candidate_recheck_blockhash_not_found",
-        ),
-        s1_candidate_recheck_dropped: field_i64(&fields, "s1_candidate_recheck_dropped"),
-        s1_candidate_recheck_other: field_i64(&fields, "s1_candidate_recheck_other"),
-        s1_early_ordinary_dispatched_batches: field_i64(
-            &fields,
-            "s1_early_ordinary_dispatched_batches",
-        ),
-        s1_early_ordinary_passes: field_i64(&fields, "s1_early_ordinary_passes"),
-        s1_ordinary_in_flight_worker_samples: field_i64(
-            &fields,
-            "s1_ordinary_in_flight_worker_samples",
-        ),
-        s1_ordinary_lock_or_admission_blocked_rounds: field_i64(
-            &fields,
-            "s1_ordinary_lock_or_admission_blocked_rounds",
-        ),
-        s1_ordinary_no_worker_capacity_rounds: field_i64(
-            &fields,
-            "s1_ordinary_no_worker_capacity_rounds",
-        ),
-        s1_ordinary_queue_busy_worker_samples: field_i64(
-            &fields,
-            "s1_ordinary_queue_busy_worker_samples",
-        ),
-        worker_estimated_cu_total: field_i64(&fields, "worker_estimated_cu_total"),
-        worker_transaction_total: field_i64(&fields, "worker_transaction_total"),
-        worker_work_total: field_i64(&fields, "worker_work_total"),
-    }
-}
-
-fn map_qos_worker(point: &DataPoint, host_id: &str) -> QosWorkerRow {
-    let fields = parse_datapoint_fields(&point.fields);
-    let time_ns = point_time_ns(point);
-    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
-    QosWorkerRow {
-        timestamp,
-        time_ns,
-        host_id,
-        candidate_batches: field_i64(&fields, "candidate_batches"),
-        enqueue_blocked_us: field_i64(&fields, "enqueue_blocked_us"),
-        estimated_compute_units: field_i64(&fields, "estimated_compute_units"),
-        estimated_cu_per_second: field_i64(&fields, "estimated_cu_per_second"),
-        estimated_cu_share_ppm: field_i64(&fields, "estimated_cu_share_ppm"),
-        max_batch_transactions: field_i64(&fields, "max_batch_transactions"),
-        max_sender_queue_depth: field_i64(&fields, "max_sender_queue_depth"),
-        ordinary_batches: field_i64(&fields, "ordinary_batches"),
-        transaction_share_ppm: field_i64(&fields, "transaction_share_ppm"),
-        transactions: field_i64(&fields, "transactions"),
-        transactions_per_second: field_i64(&fields, "transactions_per_second"),
-        work_batches: field_i64(&fields, "work_batches"),
-        work_per_second: field_i64(&fields, "work_per_second"),
-        work_share_ppm: field_i64(&fields, "work_share_ppm"),
-        worker: field_i64(&fields, "worker"),
-    }
+    row
 }
 
 pub(crate) fn build_client(url: &str, db: &str, user: &str, password: &str) -> Client {
@@ -466,18 +329,32 @@ pub(crate) async fn write_rakurai_points(client: &Client, points: &[DataPoint], 
     let mut status = Vec::new();
     let mut qos_tp = Vec::new();
     let mut qos_worker = Vec::new();
+    let mut p2c_update = Vec::new();
+    let mut p2c_total_update = Vec::new();
 
     for point in points {
         match point.name {
-            "rakurai_info_bundle_lifecycle" => bundle.push(map_bundle_lifecycle(point, host_id)),
-            "rakurai_tin_connection_state" => tin.push(map_tin(point, host_id)),
+            "rakurai_info_bundle_lifecycle" => {
+                bundle.push(BundleLifecycleRow::from_point(point, host_id))
+            }
+            "rakurai_tin_connection_state" => {
+                tin.push(TinConnectionStateRow::from_point(point, host_id))
+            }
             "rakurai_warning" => warning.push(map_warning(point, host_id)),
             "rakurai_info" => info.push(map_info(point, host_id)),
-            "rakurai_status" => status.push(map_status(point, host_id)),
+            "rakurai_status" => status.push(StatusRow::from_point(point, host_id)),
             "rakurai_scheduler_qos_throughput" => {
-                qos_tp.push(map_qos_throughput(point, host_id))
+                qos_tp.push(QosThroughputRow::from_point(point, host_id))
             }
-            "rakurai_scheduler_qos_worker" => qos_worker.push(map_qos_worker(point, host_id)),
+            "rakurai_scheduler_qos_worker" => {
+                qos_worker.push(QosWorkerRow::from_point(point, host_id))
+            }
+            "rakurai_p2c_update_count" => {
+                p2c_update.push(P2cUpdateCountRow::from_point(point, host_id))
+            }
+            "rakurai_p2c_total_update_count" => {
+                p2c_total_update.push(P2cTotalUpdateCountRow::from_point(point, host_id))
+            }
             name if name.starts_with("rakurai") => warn_unknown_table_once(name),
             _ => {}
         }
@@ -490,6 +367,8 @@ pub(crate) async fn write_rakurai_points(client: &Client, points: &[DataPoint], 
     insert_rows(client, "rakurai_status", &status).await;
     insert_rows(client, "rakurai_scheduler_qos_throughput", &qos_tp).await;
     insert_rows(client, "rakurai_scheduler_qos_worker", &qos_worker).await;
+    insert_rows(client, "rakurai_p2c_update_count", &p2c_update).await;
+    insert_rows(client, "rakurai_p2c_total_update_count", &p2c_total_update).await;
 }
 
 #[cfg(test)]
@@ -504,6 +383,8 @@ mod tests {
         "rakurai_status",
         "rakurai_scheduler_qos_throughput",
         "rakurai_scheduler_qos_worker",
+        "rakurai_p2c_update_count",
+        "rakurai_p2c_total_update_count",
     ];
 
     #[test]
@@ -522,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_bundle_lifecycle() {
+    fn test_row_from_point_maps_typed_fields() {
         let mut point = DataPoint::new("rakurai_info_bundle_lifecycle");
         point.add_field_str("bundle_id", "abc");
         point.add_field_i64("num_txs", 3);
@@ -530,162 +411,46 @@ mod tests {
         point.add_field_str("outcome", "landed");
         point.add_field_str("drop_reason", "");
 
-        let row = map_bundle_lifecycle(&point, "host-1");
+        let row = BundleLifecycleRow::from_point(&point, "host-1");
         assert_eq!(row.host_id, "host-1");
         assert_eq!(row.bundle_id.as_deref(), Some("abc"));
         assert_eq!(row.num_txs, Some(3));
         assert_eq!(row.is_primary, Some(1));
         assert_eq!(row.outcome.as_deref(), Some("landed"));
-        assert!(row.drop_reason.is_none());
+        assert!(row.drop_reason.is_none()); // empty string -> no value, not Some("")
         assert_eq!(row.time_ns, point_time_ns(&point));
+
+        let mut tin = DataPoint::new("rakurai_tin_connection_state");
+        tin.add_field_str("uuid", "u-1");
+        tin.add_field_bool("primary", true); // renamed column: primary_conn <- "primary"
+        let tin_row = TinConnectionStateRow::from_point(&tin, "host-1");
+        assert_eq!(tin_row.uuid.as_deref(), Some("u-1"));
+        assert_eq!(tin_row.primary_conn, Some(true));
+
+        let mut p2c = DataPoint::new("rakurai_p2c_update_count");
+        p2c.add_field_i64("total_count", 5);
+        p2c.add_field_bool("p2c_tpu_enabled", true);
+        let p2c_row = P2cUpdateCountRow::from_point(&p2c, "host-1");
+        assert_eq!(p2c_row.total_count, Some(5));
+        assert_eq!(p2c_row.p2c_tpu_enabled, Some(true));
     }
 
     #[test]
-    fn test_map_warning_folds_message() {
+    fn test_map_warning_and_info_fall_back_to_legacy_field_name() {
         let mut point = DataPoint::new("rakurai_warning");
-        point.add_field_str("rakurai_abort_log", "scheduler aborted");
+        point.add_field_str("rakurai_warning_log", "warn only");
         let row = map_warning(&point, "host-1");
-        assert_eq!(row.rakurai_abort_log.as_deref(), Some("scheduler aborted"));
+        assert_eq!(row.rakurai_abort_log.as_deref(), Some("warn only"));
 
-        let mut point2 = DataPoint::new("rakurai_warning");
-        point2.add_field_str("rakurai_warning_log", "warn only");
-        let row2 = map_warning(&point2, "host-1");
-        assert_eq!(row2.rakurai_abort_log.as_deref(), Some("warn only"));
-    }
-
-    #[test]
-    fn test_map_status() {
-        let mut point = DataPoint::new("rakurai_status");
-        point.add_field_bool("enabled", true);
-        let row = map_status(&point, "host-1");
-        assert_eq!(row.enabled, Some(true));
-    }
-
-    #[test]
-    fn test_map_tin_includes_actual_url() {
-        let mut point = DataPoint::new("rakurai_tin_connection_state");
-        point.add_field_str("url", "https://configured.example");
-        point.add_field_str("actual_url", "https://resolved.example");
-        point.add_field_str("uuid", "u-1");
-        point.add_field_bool("primary", true);
-        let row = map_tin(&point, "host-1");
-        assert_eq!(row.url.as_deref(), Some("https://configured.example"));
-        assert_eq!(row.actual_url.as_deref(), Some("https://resolved.example"));
-        assert_eq!(row.uuid.as_deref(), Some("u-1"));
-        assert_eq!(row.primary_conn, Some(true));
+        let mut point = DataPoint::new("rakurai_info");
+        point.add_field_str("some_other_field", "fallback message");
+        let row = map_info(&point, "host-1");
+        assert_eq!(row.rakurai_info_log.as_deref(), Some("fallback message"));
     }
 
     #[test]
     fn test_unknown_table_not_allowed() {
         assert!(!ALLOWED_TABLES.contains(&"rakurai_write_grant_probe"));
         assert!(ALLOWED_TABLES.contains(&"rakurai_warning"));
-    }
-
-    /// Live end-to-end smoke: official client + TLS verify + insert all allowlisted tables.
-    ///
-    /// `ch_writer` is INSERT-only; SELECT readback is best-effort (skipped on ACCESS_DENIED).
-    ///
-    /// Run with:
-    /// `CH_SMOKE_PASSWORD=... cargo test -p solana-metrics --features agave-unstable-api --lib \
-    ///    smoke_live_clickhouse_all_tables -- --ignored --nocapture`
-    #[test]
-    #[ignore = "live ClickHouse network smoke"]
-    fn smoke_live_clickhouse_all_tables() {
-        let host = std::env::var("CH_SMOKE_HOST")
-            .unwrap_or_else(|_| "https://metrics.rakurai.io:8443".to_string());
-        let db = std::env::var("CH_SMOKE_DB").unwrap_or_else(|_| "rakurai_stats_db".to_string());
-        let user = std::env::var("CH_SMOKE_USER").unwrap_or_else(|_| "ch_writer".to_string());
-        let password = std::env::var("CH_SMOKE_PASSWORD")
-            .expect("set CH_SMOKE_PASSWORD to run live ClickHouse smoke");
-
-        let marker = format!(
-            "crate-smoke-{}",
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        );
-
-        let client = build_client(&host, &db, &user, &password);
-
-        let mut bundle_dp = DataPoint::new("rakurai_info_bundle_lifecycle");
-        bundle_dp.add_field_str("bundle_id", &marker);
-        bundle_dp.add_field_i64("num_txs", 1);
-        bundle_dp.add_field_str("outcome", "smoke");
-
-        let mut tin_dp = DataPoint::new("rakurai_tin_connection_state");
-        tin_dp.add_field_bool("primary", true);
-        tin_dp.add_field_str("state", "smoke");
-        tin_dp.add_field_str("source", &marker);
-        tin_dp.add_field_str("url", "https://smoke.example/configured");
-        tin_dp.add_field_str("actual_url", "https://smoke.example/resolved");
-        tin_dp.add_field_str("uuid", &marker);
-
-        let mut warning_dp = DataPoint::new("rakurai_warning");
-        warning_dp.add_field_str("rakurai_abort_log", &marker);
-
-        let mut info_dp = DataPoint::new("rakurai_info");
-        info_dp.add_field_str("rakurai_info_log", &marker);
-
-        let mut status_dp = DataPoint::new("rakurai_status");
-        status_dp.add_field_bool("enabled", true);
-
-        let mut qos_tp_dp = DataPoint::new("rakurai_scheduler_qos_throughput");
-        qos_tp_dp.add_field_i64("ordinary_transaction_count", 1);
-
-        let mut qos_worker_dp = DataPoint::new("rakurai_scheduler_qos_worker");
-        qos_worker_dp.add_field_i64("worker", 0);
-        qos_worker_dp.add_field_i64("transactions", 1);
-
-        let points = [
-            bundle_dp,
-            tin_dp,
-            warning_dp,
-            info_dp,
-            status_dp,
-            qos_tp_dp,
-            qos_worker_dp,
-        ];
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-
-        rt.block_on(async {
-            let one: u8 = client
-                .query("SELECT 1")
-                .fetch_one()
-                .await
-                .expect("SELECT 1 over verified TLS failed");
-            assert_eq!(one, 1, "ClickHouse SELECT 1");
-            eprintln!("OK SELECT 1 (verified TLS)");
-
-            write_rakurai_points(&client, &points, &marker).await;
-            eprintln!("OK write_rakurai_points for all allowlisted tables");
-
-            match client
-                .query("SELECT count() FROM rakurai_info WHERE host_id = ?")
-                .bind(&marker)
-                .fetch_one::<u64>()
-                .await
-            {
-                Ok(n) => {
-                    assert!(n >= 1, "expected readback rows, got {n}");
-                    eprintln!("OK SELECT readback rakurai_info count={n}");
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    assert!(
-                        msg.contains("ACCESS_DENIED") || msg.contains("Not enough privileges"),
-                        "unexpected SELECT failure: {msg}"
-                    );
-                    eprintln!(
-                        "OK INSERT-only user (SELECT denied as expected): {}",
-                        msg.lines().next().unwrap_or(&msg)
-                    );
-                }
-            }
-        });
     }
 }

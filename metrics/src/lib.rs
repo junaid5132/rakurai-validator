@@ -1,6 +1,6 @@
 #![cfg(feature = "agave-unstable-api")]
 #![allow(clippy::arithmetic_side_effects)]
-#[cfg(feature = "influxdb")]
+#[cfg(not(feature = "without_influxdb"))]
 pub(crate) mod clickhouse;
 pub mod counter;
 pub mod datapoint;

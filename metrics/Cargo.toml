@@ -20,8 +20,7 @@ name = "solana_metrics"
 [features]
 agave-unstable-api = []
 default = ["influxdb"]
-# Enables InfluxDB (Solana) + ClickHouse (Rakurai) remote writers.
-# Use `--no-default-features` for a metrics agent that only buffers / local abort dumps.
+without_influxdb = []
 influxdb = ["dep:reqwest", "dep:clickhouse", "dep:chrono", "dep:tokio", "dep:serde"]
 
 [dependencies]
@@ -45,7 +44,6 @@ rand = { workspace = true }
 serial_test = { workspace = true }
 solana-metrics = { path = ".", features = ["agave-unstable-api"] }
 solana-sha256-hasher = { workspace = true, features = ["sha2"] }
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [[bench]]
 name = "metrics"
