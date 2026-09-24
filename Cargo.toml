@@ -230,6 +230,7 @@ caps = "0.5.6"
 cfg-if = "1.0.4"
 chrono = { version = "0.4.45", default-features = false }
 chrono-humanize = "0.2.3"
+clickhouse = { version = "=0.15.2", default-features = true, features = ["rustls-tls", "chrono"] }
 clap = { version = "2.33.1", default-features = false, features = ["suggestions"] }
 console = "0.16.3"
 const_format = "0.2.36"

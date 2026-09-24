@@ -4,9 +4,9 @@
 --   1) Existing envs that need ALTER + MATERIALIZE
 --   2) Documentation of what new CREATE TABLE templates must include
 --
--- Producer CREATE TABLE IF NOT EXISTS (metrics/src/clickhouse.rs) embeds the same
--- INDEX / PROJECTION definitions so fresh databases match production.
--- INSERT path is unchanged: same columns; ClickHouse maintains indexes/projection.
+-- The metrics crate (official `clickhouse` client) only INSERTs rows; schema
+-- DDL is managed out-of-band. INSERT path is unchanged: same columns;
+-- ClickHouse maintains indexes/projection.
 --
 -- We intentionally keep ORDER BY (host_id, timestamp). Timestamp-first dashboard
 -- reads use PROJECTION proj_by_timestamp instead of a full table rebuild.

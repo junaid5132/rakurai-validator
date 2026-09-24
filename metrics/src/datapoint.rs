@@ -87,6 +87,19 @@ impl DataPoint {
     }
 }
 
+/// Reverse of [`DataPoint::add_field_str`] (quoted Influx string fields).
+pub(crate) fn decode_field_str(raw: &str) -> String {
+    let inner = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    if !inner.contains('\\') {
+        return inner.to_string();
+    }
+    inner.replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
 impl fmt::Display for DataPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "datapoint: {}", self.name)?;

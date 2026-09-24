@@ -1,85 +1,44 @@
-//! ClickHouse HTTP INSERT writer for Rakurai metrics datapoints.
+//! Rakurai metrics → ClickHouse via the official `clickhouse` crate.
+//!
+//! Only maps `DataPoint`s to typed rows and inserts. Transport, encoding, TLS,
+//! and compression are owned by the crate.
 
 use {
     crate::datapoint::DataPoint,
+    chrono::{DateTime, Utc},
+    clickhouse as ch,
+    clickhouse::{Row, RowOwned, RowWrite},
     log::warn,
-    serde_json::{Map, Value},
+    serde::Serialize,
     std::{
         collections::{HashMap, HashSet},
-        sync::Mutex,
-        time::UNIX_EPOCH,
+        sync::{LazyLock, Mutex},
+        time::{Duration, UNIX_EPOCH},
     },
 };
 
-/// Tables that accept Rakurai metrics writes. Unknown `rakurai*` names are skipped.
-pub const ALLOWED_TABLES: &[&str] = &[
-    "rakurai_info_bundle_lifecycle",
-    "rakurai_tin_connection_state",
-    "rakurai_warning",
-    "rakurai_info",
-    "rakurai_status",
-    "rakurai_scheduler_qos_throughput",
-    "rakurai_scheduler_qos_worker",
-];
+pub(crate) use ch::Client;
 
-/// Max JSONEachRow lines per HTTP INSERT to bound request body size.
-#[cfg(not(feature = "without_influxdb"))]
-const MAX_ROWS_PER_INSERT: usize = 500;
-/// After a failed CREATE, wait before retrying CREATE (INSERT is still attempted).
-#[cfg(not(feature = "without_influxdb"))]
-const ENSURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
-/// Cap ClickHouse error bodies in logs.
-#[cfg(not(feature = "without_influxdb"))]
-const MAX_ERROR_BODY_CHARS: usize = 512;
+const INSERT_TIMEOUT: Duration = Duration::from_secs(5);
 
-static UNKNOWN_TABLE_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-/// Poison-safe lock for process-local warn/ensure caches (never panic the metrics agent).
-fn lock_string_set(
-    mutex: &Mutex<Option<HashSet<String>>>,
-) -> std::sync::MutexGuard<'_, Option<HashSet<String>>> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(not(feature = "without_influxdb"))]
-fn truncate_for_log(text: &str) -> String {
-    let mut truncated: String = text.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    if text.chars().count() > MAX_ERROR_BODY_CHARS {
-        truncated.push_str("…[truncated]");
-    }
-    truncated
-}
-
-#[cfg(not(feature = "without_influxdb"))]
-fn read_error_body(response: reqwest::blocking::Response) -> String {
-    response
-        .text()
-        .map(|t| {
-            if t.is_empty() {
-                "[empty body]".to_string()
-            } else {
-                truncate_for_log(&t)
-            }
-        })
-        .unwrap_or_else(|_| "[unreadable body]".to_string())
-}
+static UNKNOWN_TABLE_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Parsed field value after stripping Influx line-protocol encoding.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ParsedFieldValue {
+enum ParsedFieldValue {
     String(String),
     I64(i64),
     F64(f64),
     Bool(bool),
 }
 
-pub type ParsedFields = HashMap<String, ParsedFieldValue>;
+type ParsedFields = HashMap<&'static str, ParsedFieldValue>;
 
-/// Strip Influx quotes / `i` suffixes and return typed field values.
-pub fn parse_datapoint_fields(fields: &[(&'static str, String)]) -> ParsedFields {
+fn parse_datapoint_fields(fields: &[(&'static str, String)]) -> ParsedFields {
     let mut parsed = ParsedFields::new();
     for (name, raw) in fields {
-        parsed.insert(name.to_string(), parse_field_value(raw));
+        parsed.insert(*name, parse_field_value(raw));
     }
     parsed
 }
@@ -91,12 +50,13 @@ fn parse_field_value(raw: &str) -> ParsedFieldValue {
         }
     }
     if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-        return ParsedFieldValue::String(unquote_influx_string(&raw[1..raw.len() - 1]));
+        return ParsedFieldValue::String(crate::datapoint::decode_field_str(raw));
     }
-    match raw {
-        "true" => return ParsedFieldValue::Bool(true),
-        "false" => return ParsedFieldValue::Bool(false),
-        _ => {}
+    if raw == "true" {
+        return ParsedFieldValue::Bool(true);
+    }
+    if raw == "false" {
+        return ParsedFieldValue::Bool(false);
     }
     if let Ok(v) = raw.parse::<f64>() {
         return ParsedFieldValue::F64(v);
@@ -104,38 +64,13 @@ fn parse_field_value(raw: &str) -> ParsedFieldValue {
     ParsedFieldValue::String(raw.to_string())
 }
 
-fn unquote_influx_string(raw: &str) -> String {
-    raw.replace("\\\"", "\"").replace("\\\\", "\\")
-}
-
 fn warn_unknown_table_once(table: &str) {
-    let mut guard = lock_string_set(&UNKNOWN_TABLE_WARNED);
-    let warned = guard.get_or_insert_with(HashSet::new);
+    let mut warned = UNKNOWN_TABLE_WARNED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if warned.insert(table.to_string()) {
-        warn!(
-            "skipping unknown rakurai measurement {table:?}; not in ClickHouse allowlist"
-        );
+        warn!("skipping unknown rakurai measurement {table:?}; not in ClickHouse allowlist");
     }
-}
-
-pub fn is_allowed_table(name: &str) -> bool {
-    ALLOWED_TABLES.contains(&name)
-}
-
-/// Group datapoints by measurement (table) name.
-pub fn group_points_by_table(points: &[DataPoint]) -> HashMap<&'static str, Vec<&DataPoint>> {
-    let mut grouped: HashMap<&'static str, Vec<&DataPoint>> = HashMap::new();
-    for point in points {
-        if !point.name.starts_with("rakurai") {
-            continue;
-        }
-        if !is_allowed_table(point.name) {
-            warn_unknown_table_once(point.name);
-            continue;
-        }
-        grouped.entry(point.name).or_default().push(point);
-    }
-    grouped
 }
 
 fn point_time_ns(point: &DataPoint) -> u64 {
@@ -146,587 +81,434 @@ fn point_time_ns(point: &DataPoint) -> u64 {
         .unwrap_or(0)
 }
 
-fn field_as_string(fields: &ParsedFields, key: &str) -> String {
+fn timestamp_from_nanos(nanos: u64) -> DateTime<Utc> {
+    DateTime::from_timestamp((nanos / 1_000_000_000) as i64, (nanos % 1_000_000_000) as u32)
+        .unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+fn field_string(fields: &ParsedFields, key: &'static str) -> Option<String> {
     match fields.get(key) {
-        Some(ParsedFieldValue::String(s)) => s.clone(),
-        Some(ParsedFieldValue::I64(v)) => v.to_string(),
-        Some(ParsedFieldValue::F64(v)) => v.to_string(),
-        Some(ParsedFieldValue::Bool(v)) => v.to_string(),
-        None => String::new(),
+        Some(ParsedFieldValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(ParsedFieldValue::I64(v)) => Some(v.to_string()),
+        Some(ParsedFieldValue::F64(v)) => Some(v.to_string()),
+        Some(ParsedFieldValue::Bool(v)) => Some(v.to_string()),
+        _ => None,
     }
 }
 
-fn field_as_i64(fields: &ParsedFields, key: &str) -> i64 {
+fn field_i64(fields: &ParsedFields, key: &'static str) -> Option<i64> {
     match fields.get(key) {
-        Some(ParsedFieldValue::I64(v)) => *v,
-        Some(ParsedFieldValue::F64(v)) => *v as i64,
-        Some(ParsedFieldValue::Bool(v)) => i64::from(*v),
-        Some(ParsedFieldValue::String(s)) => s.parse().unwrap_or(0),
-        None => 0,
+        Some(ParsedFieldValue::I64(v)) => Some(*v),
+        Some(ParsedFieldValue::F64(v)) => Some(*v as i64),
+        Some(ParsedFieldValue::Bool(v)) => Some(i64::from(*v)),
+        Some(ParsedFieldValue::String(s)) => s.parse().ok(),
+        None => None,
     }
 }
 
-fn field_as_bool(fields: &ParsedFields, key: &str) -> bool {
+fn field_bool(fields: &ParsedFields, key: &'static str) -> Option<bool> {
     match fields.get(key) {
-        Some(ParsedFieldValue::Bool(v)) => *v,
-        Some(ParsedFieldValue::I64(v)) => *v != 0,
-        Some(ParsedFieldValue::F64(v)) => *v != 0.0,
-        Some(ParsedFieldValue::String(s)) => s == "true" || s == "1",
-        None => false,
+        Some(ParsedFieldValue::Bool(v)) => Some(*v),
+        Some(ParsedFieldValue::I64(v)) => Some(*v != 0),
+        Some(ParsedFieldValue::F64(v)) => Some(*v != 0.0),
+        Some(ParsedFieldValue::String(s)) => Some(s == "true" || s == "1"),
+        None => None,
     }
 }
 
-fn nullable_string(value: String) -> Value {
-    if value.is_empty() {
-        Value::Null
-    } else {
-        Value::String(value)
-    }
+#[derive(Debug, Clone, Row, Serialize)]
+struct BundleLifecycleRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    block_engine_uuid: Option<String>,
+    bundle_id: Option<String>,
+    bundle_priority: Option<i64>,
+    drop_reason: Option<String>,
+    end_timestamp_ns: Option<i64>,
+    has_postpack_confirmation: Option<i64>,
+    is_primary: Option<i64>,
+    num_txs: Option<i64>,
+    outcome: Option<String>,
+    p2c_id: Option<String>,
+    priority_fee_lamports: Option<i64>,
+    received_slot: Option<i64>,
+    signatures: Option<String>,
+    start_timestamp_ns: Option<i64>,
+    tip_lamports: Option<i64>,
+    total_cus: Option<i64>,
 }
 
-fn unix_nanos_to_datetime64_utc(nanos: u64) -> String {
-    let secs = (nanos / 1_000_000_000) as i64;
-    let sub_nanos = (nanos % 1_000_000_000) as u32;
-    let days = secs.div_euclid(86_400);
-    let day_secs = secs.rem_euclid(86_400) as u32;
-    let hour = day_secs / 3600;
-    let min = (day_secs % 3600) / 60;
-    let sec = day_secs % 60;
-
-    // civil_from_days — http://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe + era * 400) as i32;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (mp + if mp < 10 { 3 } else { -9 }) as u32;
-    let year = y + if m <= 2 { 1 } else { 0 };
-
-    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}.{sub_nanos:09}")
+#[derive(Debug, Clone, Row, Serialize)]
+struct TinConnectionStateRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    #[serde(rename = "primary")]
+    primary_conn: Option<bool>,
+    source: Option<String>,
+    state: Option<String>,
+    url: Option<String>,
+    actual_url: Option<String>,
+    uuid: Option<String>,
 }
 
-fn insert_common(obj: &mut Map<String, Value>, host_id: &str, time_ns: u64) {
-    obj.insert(
-        "timestamp".into(),
-        Value::String(unix_nanos_to_datetime64_utc(time_ns)),
-    );
-    obj.insert("time_ns".into(), Value::from(time_ns));
-    obj.insert("host_id".into(), Value::String(host_id.to_string()));
+#[derive(Debug, Clone, Row, Serialize)]
+struct WarningRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    rakurai_abort_log: Option<String>,
 }
 
-fn insert_i64_field(obj: &mut Map<String, Value>, fields: &ParsedFields, key: &str) {
-    obj.insert(key.into(), Value::from(field_as_i64(fields, key)));
+#[derive(Debug, Clone, Row, Serialize)]
+struct InfoRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    rakurai_info_log: Option<String>,
 }
 
-fn insert_nullable_string_field(obj: &mut Map<String, Value>, fields: &ParsedFields, key: &str) {
-    obj.insert(key.into(), nullable_string(field_as_string(fields, key)));
+#[derive(Debug, Clone, Row, Serialize)]
+struct StatusRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    enabled: Option<bool>,
 }
 
-/// Serialize one datapoint to a JSONEachRow line for its table.
-///
-/// Column layout matches live `rakurai_stats_db` on ClickHouse
-/// (`timestamp` DateTime64(9,'UTC') + `time_ns` UInt64).
-pub fn serialize_point(point: &DataPoint, host_id: &str) -> Option<String> {
-    if !is_allowed_table(point.name) {
-        warn_unknown_table_once(point.name);
-        return None;
-    }
+#[derive(Debug, Clone, Row, Serialize)]
+struct QosThroughputRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    candidate_non_singleton_count: Option<i64>,
+    candidate_singleton_count: Option<i64>,
+    dedicated_lane_dequeue_count: Option<i64>,
+    dedicated_lane_enqueue_count: Option<i64>,
+    dedicated_lane_service_max_us: Option<i64>,
+    dedicated_lane_service_us: Option<i64>,
+    ingress_ordinary: Option<i64>,
+    ingress_pruner_candidate: Option<i64>,
+    mixed_batch_count: Option<i64>,
+    ordinary_batch_count: Option<i64>,
+    ordinary_batch_max_transactions: Option<i64>,
+    ordinary_transaction_count: Option<i64>,
+    report_elapsed_us: Option<i64>,
+    s1_bounded_ordinary_dispatched_batches: Option<i64>,
+    s1_bounded_ordinary_passes: Option<i64>,
+    s1_candidate_recheck_already_processed: Option<i64>,
+    s1_candidate_recheck_blockhash_not_found: Option<i64>,
+    s1_candidate_recheck_dropped: Option<i64>,
+    s1_candidate_recheck_other: Option<i64>,
+    s1_early_ordinary_dispatched_batches: Option<i64>,
+    s1_early_ordinary_passes: Option<i64>,
+    s1_ordinary_in_flight_worker_samples: Option<i64>,
+    s1_ordinary_lock_or_admission_blocked_rounds: Option<i64>,
+    s1_ordinary_no_worker_capacity_rounds: Option<i64>,
+    s1_ordinary_queue_busy_worker_samples: Option<i64>,
+    worker_estimated_cu_total: Option<i64>,
+    worker_transaction_total: Option<i64>,
+    worker_work_total: Option<i64>,
+}
 
+#[derive(Debug, Clone, Row, Serialize)]
+struct QosWorkerRow {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    timestamp: DateTime<Utc>,
+    time_ns: u64,
+    host_id: String,
+    candidate_batches: Option<i64>,
+    enqueue_blocked_us: Option<i64>,
+    estimated_compute_units: Option<i64>,
+    estimated_cu_per_second: Option<i64>,
+    estimated_cu_share_ppm: Option<i64>,
+    max_batch_transactions: Option<i64>,
+    max_sender_queue_depth: Option<i64>,
+    ordinary_batches: Option<i64>,
+    transaction_share_ppm: Option<i64>,
+    transactions: Option<i64>,
+    transactions_per_second: Option<i64>,
+    work_batches: Option<i64>,
+    work_per_second: Option<i64>,
+    work_share_ppm: Option<i64>,
+    worker: Option<i64>,
+}
+
+fn common(host_id: &str, time_ns: u64) -> (DateTime<Utc>, u64, String) {
+    (timestamp_from_nanos(time_ns), time_ns, host_id.to_string())
+}
+
+fn map_bundle_lifecycle(point: &DataPoint, host_id: &str) -> BundleLifecycleRow {
     let fields = parse_datapoint_fields(&point.fields);
     let time_ns = point_time_ns(point);
-
-    let row = match point.name {
-        "rakurai_info_bundle_lifecycle" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            insert_nullable_string_field(&mut obj, &fields, "block_engine_uuid");
-            insert_nullable_string_field(&mut obj, &fields, "bundle_id");
-            insert_i64_field(&mut obj, &fields, "bundle_priority");
-            insert_nullable_string_field(&mut obj, &fields, "drop_reason");
-            insert_i64_field(&mut obj, &fields, "end_timestamp_ns");
-            insert_i64_field(&mut obj, &fields, "has_postpack_confirmation");
-            insert_i64_field(&mut obj, &fields, "is_primary");
-            insert_i64_field(&mut obj, &fields, "num_txs");
-            insert_nullable_string_field(&mut obj, &fields, "outcome");
-            insert_nullable_string_field(&mut obj, &fields, "p2c_id");
-            insert_i64_field(&mut obj, &fields, "priority_fee_lamports");
-            insert_i64_field(&mut obj, &fields, "received_slot");
-            insert_nullable_string_field(&mut obj, &fields, "signatures");
-            insert_i64_field(&mut obj, &fields, "start_timestamp_ns");
-            insert_i64_field(&mut obj, &fields, "tip_lamports");
-            insert_i64_field(&mut obj, &fields, "total_cus");
-            Value::Object(obj)
-        }
-        "rakurai_tin_connection_state" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            obj.insert("primary".into(), Value::Bool(field_as_bool(&fields, "primary")));
-            insert_nullable_string_field(&mut obj, &fields, "source");
-            insert_nullable_string_field(&mut obj, &fields, "state");
-            insert_nullable_string_field(&mut obj, &fields, "url");
-            insert_nullable_string_field(&mut obj, &fields, "uuid");
-            Value::Object(obj)
-        }
-        "rakurai_warning" => {
-            // Live table only has rakurai_abort_log; fold warning_log into it when abort is empty.
-            let abort_log = field_as_string(&fields, "rakurai_abort_log");
-            let warning_log = field_as_string(&fields, "rakurai_warning_log");
-            let message = if !abort_log.is_empty() {
-                abort_log
-            } else {
-                warning_log
-            };
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            obj.insert("rakurai_abort_log".into(), nullable_string(message));
-            Value::Object(obj)
-        }
-        "rakurai_info" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            let log = field_as_string(&fields, "rakurai_info_log");
-            let log = if log.is_empty() {
-                // Fallback: first string-ish field value if producers use another name.
-                fields
-                    .values()
-                    .find_map(|v| match v {
-                        ParsedFieldValue::String(s) if !s.is_empty() => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default()
-            } else {
-                log
-            };
-            obj.insert("rakurai_info_log".into(), nullable_string(log));
-            Value::Object(obj)
-        }
-        "rakurai_status" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            obj.insert(
-                "enabled".into(),
-                Value::Bool(field_as_bool(&fields, "enabled")),
-            );
-            Value::Object(obj)
-        }
-        "rakurai_scheduler_qos_throughput" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            for key in QOS_THROUGHPUT_I64_FIELDS {
-                insert_i64_field(&mut obj, &fields, key);
-            }
-            Value::Object(obj)
-        }
-        "rakurai_scheduler_qos_worker" => {
-            let mut obj = Map::new();
-            insert_common(&mut obj, host_id, time_ns);
-            for key in QOS_WORKER_I64_FIELDS {
-                insert_i64_field(&mut obj, &fields, key);
-            }
-            Value::Object(obj)
-        }
-        _ => return None,
-    };
-
-    match serde_json::to_string(&row) {
-        Ok(json) => Some(json),
-        Err(err) => {
-            warn!(
-                "failed to serialize ClickHouse row for table {}: {err}",
-                point.name
-            );
-            None
-        }
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    BundleLifecycleRow {
+        timestamp,
+        time_ns,
+        host_id,
+        block_engine_uuid: field_string(&fields, "block_engine_uuid"),
+        bundle_id: field_string(&fields, "bundle_id"),
+        bundle_priority: field_i64(&fields, "bundle_priority"),
+        drop_reason: field_string(&fields, "drop_reason"),
+        end_timestamp_ns: field_i64(&fields, "end_timestamp_ns"),
+        has_postpack_confirmation: field_i64(&fields, "has_postpack_confirmation"),
+        is_primary: field_i64(&fields, "is_primary"),
+        num_txs: field_i64(&fields, "num_txs"),
+        outcome: field_string(&fields, "outcome"),
+        p2c_id: field_string(&fields, "p2c_id"),
+        priority_fee_lamports: field_i64(&fields, "priority_fee_lamports"),
+        received_slot: field_i64(&fields, "received_slot"),
+        signatures: field_string(&fields, "signatures"),
+        start_timestamp_ns: field_i64(&fields, "start_timestamp_ns"),
+        tip_lamports: field_i64(&fields, "tip_lamports"),
+        total_cus: field_i64(&fields, "total_cus"),
     }
 }
 
-const QOS_THROUGHPUT_I64_FIELDS: &[&str] = &[
-    "candidate_non_singleton_count",
-    "candidate_singleton_count",
-    "dedicated_lane_dequeue_count",
-    "dedicated_lane_enqueue_count",
-    "dedicated_lane_service_max_us",
-    "dedicated_lane_service_us",
-    "ingress_ordinary",
-    "ingress_pruner_candidate",
-    "mixed_batch_count",
-    "ordinary_batch_count",
-    "ordinary_batch_max_transactions",
-    "ordinary_transaction_count",
-    "report_elapsed_us",
-    "s1_bounded_ordinary_dispatched_batches",
-    "s1_bounded_ordinary_passes",
-    "s1_candidate_recheck_already_processed",
-    "s1_candidate_recheck_blockhash_not_found",
-    "s1_candidate_recheck_dropped",
-    "s1_candidate_recheck_other",
-    "s1_early_ordinary_dispatched_batches",
-    "s1_early_ordinary_passes",
-    "s1_ordinary_in_flight_worker_samples",
-    "s1_ordinary_lock_or_admission_blocked_rounds",
-    "s1_ordinary_no_worker_capacity_rounds",
-    "s1_ordinary_queue_busy_worker_samples",
-    "worker_estimated_cu_total",
-    "worker_transaction_total",
-    "worker_work_total",
-];
-
-const QOS_WORKER_I64_FIELDS: &[&str] = &[
-    "candidate_batches",
-    "enqueue_blocked_us",
-    "estimated_compute_units",
-    "estimated_cu_per_second",
-    "estimated_cu_share_ppm",
-    "max_batch_transactions",
-    "max_sender_queue_depth",
-    "ordinary_batches",
-    "transaction_share_ppm",
-    "transactions",
-    "transactions_per_second",
-    "work_batches",
-    "work_per_second",
-    "work_share_ppm",
-    "worker",
-];
-
-fn merge_tree_suffix() -> &'static str {
-    "ENGINE = MergeTree\n\
-PARTITION BY toYYYYMM(timestamp)\n\
-ORDER BY (host_id, timestamp)\n\
-SETTINGS index_granularity = 8192"
-}
-
-/// DDL matching live `rakurai_stats_db` table shapes (`CREATE TABLE IF NOT EXISTS`).
-pub fn create_table_ddl(table: &str) -> Option<String> {
-    let suffix = merge_tree_suffix();
-    let ddl = match table {
-        "rakurai_info_bundle_lifecycle" => format!(
-            "CREATE TABLE IF NOT EXISTS {table}\n(\n\
-    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String),\n\
-    `block_engine_uuid` Nullable(String),\n\
-    `bundle_id` Nullable(String),\n\
-    `bundle_priority` Nullable(Int64),\n\
-    `drop_reason` LowCardinality(Nullable(String)),\n\
-    `end_timestamp_ns` Nullable(Int64),\n\
-    `has_postpack_confirmation` Nullable(Int64),\n\
-    `is_primary` Nullable(Int64),\n\
-    `num_txs` Nullable(Int64),\n\
-    `outcome` LowCardinality(Nullable(String)),\n\
-    `p2c_id` Nullable(String),\n\
-    `priority_fee_lamports` Nullable(Int64),\n\
-    `received_slot` Nullable(Int64),\n\
-    `signatures` Nullable(String),\n\
-    `start_timestamp_ns` Nullable(Int64),\n\
-    `tip_lamports` Nullable(Int64),\n\
-    `total_cus` Nullable(Int64),\n\
-    INDEX idx_bundle_id bundle_id TYPE bloom_filter(0.01) GRANULARITY 4,\n\
-    INDEX idx_signatures_ngram ifNull(signatures, '') TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4,\n\
-    PROJECTION proj_by_timestamp\n\
-    (\n\
-        SELECT *\n\
-        ORDER BY\n\
-            timestamp,\n\
-            host_id\n\
-    )\n\
-)\n{suffix}"
-        ),
-        "rakurai_tin_connection_state" => format!(
-            "CREATE TABLE IF NOT EXISTS {table}\n(\n\
-    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String),\n\
-    `primary` Nullable(Bool),\n\
-    `source` LowCardinality(Nullable(String)),\n\
-    `state` LowCardinality(Nullable(String)),\n\
-    `url` Nullable(String),\n\
-    `uuid` Nullable(String)\n\
-)\n{suffix}"
-        ),
-        "rakurai_warning" => format!(
-            "CREATE TABLE IF NOT EXISTS {table}\n(\n\
-    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String),\n\
-    `rakurai_abort_log` Nullable(String)\n\
-)\n{suffix}"
-        ),
-        "rakurai_info" => format!(
-            "CREATE TABLE IF NOT EXISTS {table}\n(\n\
-    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String),\n\
-    `rakurai_info_log` Nullable(String)\n\
-)\n{suffix}"
-        ),
-        "rakurai_status" => format!(
-            "CREATE TABLE IF NOT EXISTS {table}\n(\n\
-    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String),\n\
-    `enabled` Nullable(Bool)\n\
-)\n{suffix}"
-        ),
-        "rakurai_scheduler_qos_throughput" => {
-            let mut cols = String::from(
-                "    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String)",
-            );
-            for key in QOS_THROUGHPUT_I64_FIELDS {
-                cols.push_str(&format!(",\n    `{key}` Nullable(Int64)"));
-            }
-            format!("CREATE TABLE IF NOT EXISTS {table}\n(\n{cols}\n)\n{suffix}")
-        }
-        "rakurai_scheduler_qos_worker" => {
-            let mut cols = String::from(
-                "    `timestamp` DateTime64(9, 'UTC'),\n\
-    `time_ns` UInt64,\n\
-    `host_id` LowCardinality(String)",
-            );
-            for key in QOS_WORKER_I64_FIELDS {
-                cols.push_str(&format!(",\n    `{key}` Nullable(Int64)"));
-            }
-            format!("CREATE TABLE IF NOT EXISTS {table}\n(\n{cols}\n)\n{suffix}")
-        }
-        _ => return None,
-    };
-    Some(ddl)
-}
-
-/// Process-local CREATE TABLE state: success cache + failure backoff.
-#[cfg(not(feature = "without_influxdb"))]
-#[derive(Debug)]
-enum EnsureState {
-    Ensured,
-    Failed { last_attempt: std::time::Instant },
-}
-
-#[cfg(not(feature = "without_influxdb"))]
-static ENSURE_STATE: Mutex<Option<HashMap<String, EnsureState>>> = Mutex::new(None);
-
-#[cfg(not(feature = "without_influxdb"))]
-fn lock_ensure_state(
-) -> std::sync::MutexGuard<'static, Option<HashMap<String, EnsureState>>> {
-    ENSURE_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[derive(Clone, Debug)]
-pub struct RakuraiClickHouseConfig {
-    pub host: String,
-    pub db: String,
-    pub username: String,
-    pub password: String,
-}
-
-impl RakuraiClickHouseConfig {
-    pub fn complete(&self) -> bool {
-        !(self.host.is_empty()
-            || self.db.is_empty()
-            || self.username.is_empty()
-            || self.password.is_empty())
+fn map_warning(point: &DataPoint, host_id: &str) -> WarningRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    let abort = field_string(&fields, "rakurai_abort_log");
+    let warning = field_string(&fields, "rakurai_warning_log");
+    WarningRow {
+        timestamp,
+        time_ns,
+        host_id,
+        rakurai_abort_log: abort.or(warning),
     }
 }
 
-#[cfg(not(feature = "without_influxdb"))]
-pub fn build_client(insecure_tls: bool) -> Result<reqwest::blocking::Client, reqwest::Error> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(3));
-    if insecure_tls {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    builder.build()
-}
-
-#[cfg(not(feature = "without_influxdb"))]
-fn post_query(
-    client: &reqwest::blocking::Client,
-    config: &RakuraiClickHouseConfig,
-    body: String,
-) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    let host = config.host.trim_end_matches('/');
-    let url = format!("{host}/?database={}", config.db);
-    client
-        .post(&url)
-        .header("X-ClickHouse-User", &config.username)
-        .header("X-ClickHouse-Key", &config.password)
-        .body(body)
-        .send()
-}
-
-/// Best-effort CREATE TABLE IF NOT EXISTS.
-///
-/// Returns whether CREATE was confirmed successful. A `false` result does **not**
-/// mean the table is missing — INSERT should still be attempted (table may already
-/// exist, or CREATE may be temporarily unavailable). Failures are backed off so a
-/// down ClickHouse does not stall the metrics agent with repeated CREATE timeouts.
-#[cfg(not(feature = "without_influxdb"))]
-pub fn ensure_table(
-    client: &reqwest::blocking::Client,
-    config: &RakuraiClickHouseConfig,
-    table: &str,
-) -> bool {
-    {
-        let mut guard = lock_ensure_state();
-        let state = guard.get_or_insert_with(HashMap::new);
-        match state.get(table) {
-            Some(EnsureState::Ensured) => return true,
-            Some(EnsureState::Failed { last_attempt })
-                if last_attempt.elapsed() < ENSURE_RETRY_BACKOFF =>
-            {
-                return false;
-            }
-            _ => {}
-        }
-    }
-
-    let Some(ddl) = create_table_ddl(table) else {
-        warn_unknown_table_once(table);
-        return false;
-    };
-
-    match post_query(client, config, ddl) {
-        Ok(response) => {
-            if response.status().is_success() {
-                let mut guard = lock_ensure_state();
-                guard
-                    .get_or_insert_with(HashMap::new)
-                    .insert(table.to_string(), EnsureState::Ensured);
-                true
-            } else {
-                let status = response.status();
-                let text = read_error_body(response);
-                warn!("ClickHouse CREATE TABLE {table} failed: {status} {text}");
-                let mut guard = lock_ensure_state();
-                guard.get_or_insert_with(HashMap::new).insert(
-                    table.to_string(),
-                    EnsureState::Failed {
-                        last_attempt: std::time::Instant::now(),
-                    },
-                );
-                false
-            }
-        }
-        Err(err) => {
-            warn!("ClickHouse CREATE TABLE {table} error: {err}");
-            let mut guard = lock_ensure_state();
-            guard.get_or_insert_with(HashMap::new).insert(
-                table.to_string(),
-                EnsureState::Failed {
-                    last_attempt: std::time::Instant::now(),
-                },
-            );
-            false
-        }
+fn map_info(point: &DataPoint, host_id: &str) -> InfoRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    let log = field_string(&fields, "rakurai_info_log").or_else(|| {
+        fields.values().find_map(|v| match v {
+            ParsedFieldValue::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
+    });
+    InfoRow {
+        timestamp,
+        time_ns,
+        host_id,
+        rakurai_info_log: log,
     }
 }
 
-#[cfg(not(feature = "without_influxdb"))]
-fn insert_rows_once(
-    client: &reqwest::blocking::Client,
-    config: &RakuraiClickHouseConfig,
-    table: &str,
-    rows: &[String],
-) -> Result<(), String> {
+fn map_status(point: &DataPoint, host_id: &str) -> StatusRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    StatusRow {
+        timestamp,
+        time_ns,
+        host_id,
+        enabled: field_bool(&fields, "enabled"),
+    }
+}
+
+fn map_tin(point: &DataPoint, host_id: &str) -> TinConnectionStateRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    TinConnectionStateRow {
+        timestamp,
+        time_ns,
+        host_id,
+        primary_conn: field_bool(&fields, "primary"),
+        source: field_string(&fields, "source"),
+        state: field_string(&fields, "state"),
+        url: field_string(&fields, "url"),
+        actual_url: field_string(&fields, "actual_url"),
+        uuid: field_string(&fields, "uuid"),
+    }
+}
+
+fn map_qos_throughput(point: &DataPoint, host_id: &str) -> QosThroughputRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    QosThroughputRow {
+        timestamp,
+        time_ns,
+        host_id,
+        candidate_non_singleton_count: field_i64(&fields, "candidate_non_singleton_count"),
+        candidate_singleton_count: field_i64(&fields, "candidate_singleton_count"),
+        dedicated_lane_dequeue_count: field_i64(&fields, "dedicated_lane_dequeue_count"),
+        dedicated_lane_enqueue_count: field_i64(&fields, "dedicated_lane_enqueue_count"),
+        dedicated_lane_service_max_us: field_i64(&fields, "dedicated_lane_service_max_us"),
+        dedicated_lane_service_us: field_i64(&fields, "dedicated_lane_service_us"),
+        ingress_ordinary: field_i64(&fields, "ingress_ordinary"),
+        ingress_pruner_candidate: field_i64(&fields, "ingress_pruner_candidate"),
+        mixed_batch_count: field_i64(&fields, "mixed_batch_count"),
+        ordinary_batch_count: field_i64(&fields, "ordinary_batch_count"),
+        ordinary_batch_max_transactions: field_i64(&fields, "ordinary_batch_max_transactions"),
+        ordinary_transaction_count: field_i64(&fields, "ordinary_transaction_count"),
+        report_elapsed_us: field_i64(&fields, "report_elapsed_us"),
+        s1_bounded_ordinary_dispatched_batches: field_i64(
+            &fields,
+            "s1_bounded_ordinary_dispatched_batches",
+        ),
+        s1_bounded_ordinary_passes: field_i64(&fields, "s1_bounded_ordinary_passes"),
+        s1_candidate_recheck_already_processed: field_i64(
+            &fields,
+            "s1_candidate_recheck_already_processed",
+        ),
+        s1_candidate_recheck_blockhash_not_found: field_i64(
+            &fields,
+            "s1_candidate_recheck_blockhash_not_found",
+        ),
+        s1_candidate_recheck_dropped: field_i64(&fields, "s1_candidate_recheck_dropped"),
+        s1_candidate_recheck_other: field_i64(&fields, "s1_candidate_recheck_other"),
+        s1_early_ordinary_dispatched_batches: field_i64(
+            &fields,
+            "s1_early_ordinary_dispatched_batches",
+        ),
+        s1_early_ordinary_passes: field_i64(&fields, "s1_early_ordinary_passes"),
+        s1_ordinary_in_flight_worker_samples: field_i64(
+            &fields,
+            "s1_ordinary_in_flight_worker_samples",
+        ),
+        s1_ordinary_lock_or_admission_blocked_rounds: field_i64(
+            &fields,
+            "s1_ordinary_lock_or_admission_blocked_rounds",
+        ),
+        s1_ordinary_no_worker_capacity_rounds: field_i64(
+            &fields,
+            "s1_ordinary_no_worker_capacity_rounds",
+        ),
+        s1_ordinary_queue_busy_worker_samples: field_i64(
+            &fields,
+            "s1_ordinary_queue_busy_worker_samples",
+        ),
+        worker_estimated_cu_total: field_i64(&fields, "worker_estimated_cu_total"),
+        worker_transaction_total: field_i64(&fields, "worker_transaction_total"),
+        worker_work_total: field_i64(&fields, "worker_work_total"),
+    }
+}
+
+fn map_qos_worker(point: &DataPoint, host_id: &str) -> QosWorkerRow {
+    let fields = parse_datapoint_fields(&point.fields);
+    let time_ns = point_time_ns(point);
+    let (timestamp, time_ns, host_id) = common(host_id, time_ns);
+    QosWorkerRow {
+        timestamp,
+        time_ns,
+        host_id,
+        candidate_batches: field_i64(&fields, "candidate_batches"),
+        enqueue_blocked_us: field_i64(&fields, "enqueue_blocked_us"),
+        estimated_compute_units: field_i64(&fields, "estimated_compute_units"),
+        estimated_cu_per_second: field_i64(&fields, "estimated_cu_per_second"),
+        estimated_cu_share_ppm: field_i64(&fields, "estimated_cu_share_ppm"),
+        max_batch_transactions: field_i64(&fields, "max_batch_transactions"),
+        max_sender_queue_depth: field_i64(&fields, "max_sender_queue_depth"),
+        ordinary_batches: field_i64(&fields, "ordinary_batches"),
+        transaction_share_ppm: field_i64(&fields, "transaction_share_ppm"),
+        transactions: field_i64(&fields, "transactions"),
+        transactions_per_second: field_i64(&fields, "transactions_per_second"),
+        work_batches: field_i64(&fields, "work_batches"),
+        work_per_second: field_i64(&fields, "work_per_second"),
+        work_share_ppm: field_i64(&fields, "work_share_ppm"),
+        worker: field_i64(&fields, "worker"),
+    }
+}
+
+pub(crate) fn build_client(url: &str, db: &str, user: &str, password: &str) -> Client {
+    Client::default()
+        .with_url(url.trim_end_matches('/'))
+        .with_database(db)
+        .with_user(user)
+        .with_password(password)
+        .with_product_info("solana-metrics", env!("CARGO_PKG_VERSION"))
+}
+
+async fn insert_rows<T: RowOwned + RowWrite>(client: &Client, table: &str, rows: &[T]) {
     if rows.is_empty() {
-        return Ok(());
+        return;
     }
-
-    let mut body = format!("INSERT INTO {table} FORMAT JSONEachRow\n");
+    let mut insert = match client.insert::<T>(table).await {
+        Ok(insert) => insert.with_timeouts(Some(INSERT_TIMEOUT), Some(INSERT_TIMEOUT)),
+        Err(err) => {
+            warn!("ClickHouse insert start for {table} failed: {err}");
+            return;
+        }
+    };
     for row in rows {
-        body.push_str(row);
-        body.push('\n');
-    }
-
-    match post_query(client, config, body) {
-        Ok(response) => {
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                let status = response.status();
-                let text = read_error_body(response);
-                Err(format!("{status} {text}"))
-            }
+        if let Err(err) = insert.write(row).await {
+            warn!("ClickHouse insert write for {table} failed: {err}");
+            return;
         }
-        Err(err) => Err(err.to_string()),
+    }
+    if let Err(err) = insert.end().await {
+        warn!("ClickHouse insert end for {table} failed: {err}");
     }
 }
 
-/// INSERT JSONEachRow in bounded chunks. Errors are logged; never panics.
-#[cfg(not(feature = "without_influxdb"))]
-pub fn insert_batch(
-    client: &reqwest::blocking::Client,
-    config: &RakuraiClickHouseConfig,
-    table: &str,
-    rows: &[String],
-) {
-    if rows.is_empty() {
-        return;
-    }
-
-    for (chunk_idx, chunk) in rows.chunks(MAX_ROWS_PER_INSERT).enumerate() {
-        if let Err(err) = insert_rows_once(client, config, table, chunk) {
-            warn!(
-                "ClickHouse insert into {table} failed (chunk {}/{}): {err}",
-                chunk_idx + 1,
-                rows.len().div_ceil(MAX_ROWS_PER_INSERT)
-            );
-            // Continue remaining chunks; one bad chunk should not drop the rest.
-        }
-    }
-}
-
-/// Write rakurai datapoints to ClickHouse. Best-effort: never panics; failures are logged.
-#[cfg(not(feature = "without_influxdb"))]
-pub fn write_rakurai_points(
-    client: &reqwest::blocking::Client,
-    config: &RakuraiClickHouseConfig,
-    points: &[DataPoint],
-    host_id: &str,
-) {
-    if !config.complete() {
-        warn!("ClickHouse rakurai write skipped: incomplete config");
-        return;
-    }
+pub(crate) async fn write_rakurai_points(client: &Client, points: &[DataPoint], host_id: &str) {
     if host_id.is_empty() {
         warn!("ClickHouse rakurai write skipped: empty host_id");
         return;
     }
 
-    let grouped = group_points_by_table(points);
-    for (table, table_points) in grouped {
-        // Best-effort schema ensure; INSERT proceeds even if CREATE failed/backed off
-        // because the table may already exist on the cluster.
-        let _ensured = ensure_table(client, config, table);
+    let mut bundle = Vec::new();
+    let mut tin = Vec::new();
+    let mut warning = Vec::new();
+    let mut info = Vec::new();
+    let mut status = Vec::new();
+    let mut qos_tp = Vec::new();
+    let mut qos_worker = Vec::new();
 
-        let rows: Vec<String> = table_points
-            .iter()
-            .filter_map(|p| serialize_point(p, host_id))
-            .collect();
-        if rows.is_empty() {
-            continue;
+    for point in points {
+        match point.name {
+            "rakurai_info_bundle_lifecycle" => bundle.push(map_bundle_lifecycle(point, host_id)),
+            "rakurai_tin_connection_state" => tin.push(map_tin(point, host_id)),
+            "rakurai_warning" => warning.push(map_warning(point, host_id)),
+            "rakurai_info" => info.push(map_info(point, host_id)),
+            "rakurai_status" => status.push(map_status(point, host_id)),
+            "rakurai_scheduler_qos_throughput" => {
+                qos_tp.push(map_qos_throughput(point, host_id))
+            }
+            "rakurai_scheduler_qos_worker" => qos_worker.push(map_qos_worker(point, host_id)),
+            name if name.starts_with("rakurai") => warn_unknown_table_once(name),
+            _ => {}
         }
-        insert_batch(client, config, table, &rows);
     }
+
+    insert_rows(client, "rakurai_info_bundle_lifecycle", &bundle).await;
+    insert_rows(client, "rakurai_tin_connection_state", &tin).await;
+    insert_rows(client, "rakurai_warning", &warning).await;
+    insert_rows(client, "rakurai_info", &info).await;
+    insert_rows(client, "rakurai_status", &status).await;
+    insert_rows(client, "rakurai_scheduler_qos_throughput", &qos_tp).await;
+    insert_rows(client, "rakurai_scheduler_qos_worker", &qos_worker).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ALLOWED_TABLES: &[&str] = &[
+        "rakurai_info_bundle_lifecycle",
+        "rakurai_tin_connection_state",
+        "rakurai_warning",
+        "rakurai_info",
+        "rakurai_status",
+        "rakurai_scheduler_qos_throughput",
+        "rakurai_scheduler_qos_worker",
+    ];
+
     #[test]
     fn test_parse_field_value() {
-        assert_eq!(
-            parse_field_value("42i"),
-            ParsedFieldValue::I64(42)
-        );
+        assert_eq!(parse_field_value("42i"), ParsedFieldValue::I64(42));
         assert_eq!(
             parse_field_value("\"hello\""),
             ParsedFieldValue::String("hello".to_string())
@@ -740,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_bundle_lifecycle() {
+    fn test_map_bundle_lifecycle() {
         let mut point = DataPoint::new("rakurai_info_bundle_lifecycle");
         point.add_field_str("bundle_id", "abc");
         point.add_field_i64("num_txs", 3);
@@ -748,87 +530,162 @@ mod tests {
         point.add_field_str("outcome", "landed");
         point.add_field_str("drop_reason", "");
 
-        let json = serialize_point(&point, "host-1").expect("json row");
-        assert!(json.contains("\"host_id\":\"host-1\""));
-        assert!(json.contains("\"bundle_id\":\"abc\""));
-        assert!(json.contains("\"num_txs\":3"));
-        assert!(json.contains("\"drop_reason\":null"));
-        assert!(json.contains("\"time_ns\":"));
-        assert!(json.contains("\"timestamp\":"));
-        assert!(!json.contains("\"time\":"));
-        assert!(!json.contains("event_time"));
+        let row = map_bundle_lifecycle(&point, "host-1");
+        assert_eq!(row.host_id, "host-1");
+        assert_eq!(row.bundle_id.as_deref(), Some("abc"));
+        assert_eq!(row.num_txs, Some(3));
+        assert_eq!(row.is_primary, Some(1));
+        assert_eq!(row.outcome.as_deref(), Some("landed"));
+        assert!(row.drop_reason.is_none());
+        assert_eq!(row.time_ns, point_time_ns(&point));
     }
 
     #[test]
-    fn test_serialize_warning_normalizes_message() {
+    fn test_map_warning_folds_message() {
         let mut point = DataPoint::new("rakurai_warning");
         point.add_field_str("rakurai_abort_log", "scheduler aborted");
+        let row = map_warning(&point, "host-1");
+        assert_eq!(row.rakurai_abort_log.as_deref(), Some("scheduler aborted"));
 
-        let json = serialize_point(&point, "host-1").expect("json row");
-        assert!(json.contains("\"rakurai_abort_log\":\"scheduler aborted\""));
-        assert!(!json.contains("\"message\""));
-        assert!(json.contains("\"time_ns\":"));
+        let mut point2 = DataPoint::new("rakurai_warning");
+        point2.add_field_str("rakurai_warning_log", "warn only");
+        let row2 = map_warning(&point2, "host-1");
+        assert_eq!(row2.rakurai_abort_log.as_deref(), Some("warn only"));
     }
 
     #[test]
-    fn test_serialize_generic_scheduler_table() {
+    fn test_map_status() {
         let mut point = DataPoint::new("rakurai_status");
         point.add_field_bool("enabled", true);
-
-        let json = serialize_point(&point, "host-1").expect("json row");
-        assert!(json.contains("\"enabled\":true"));
-        assert!(json.contains("\"time_ns\":"));
-        assert!(!json.contains("extra_fields"));
+        let row = map_status(&point, "host-1");
+        assert_eq!(row.enabled, Some(true));
     }
 
     #[test]
-    fn test_unknown_table_skipped() {
-        let point = DataPoint::new("rakurai_write_grant_probe");
-        assert!(serialize_point(&point, "host-1").is_none());
-        assert!(!is_allowed_table("rakurai_write_grant_probe"));
+    fn test_map_tin_includes_actual_url() {
+        let mut point = DataPoint::new("rakurai_tin_connection_state");
+        point.add_field_str("url", "https://configured.example");
+        point.add_field_str("actual_url", "https://resolved.example");
+        point.add_field_str("uuid", "u-1");
+        point.add_field_bool("primary", true);
+        let row = map_tin(&point, "host-1");
+        assert_eq!(row.url.as_deref(), Some("https://configured.example"));
+        assert_eq!(row.actual_url.as_deref(), Some("https://resolved.example"));
+        assert_eq!(row.uuid.as_deref(), Some("u-1"));
+        assert_eq!(row.primary_conn, Some(true));
     }
 
     #[test]
-    fn test_group_points_by_table() {
-        let mut p1 = DataPoint::new("rakurai_warning");
-        p1.add_field_str("rakurai_abort_log", "x");
-        let mut p2 = DataPoint::new("rakurai_status");
-        p2.add_field_i64("v", 1);
-        let p3 = DataPoint::new("rakurai_write_grant_probe");
-
-        let points = [p1, p2, p3];
-        let grouped = group_points_by_table(&points);
-        assert_eq!(grouped.len(), 2);
-        assert!(grouped.contains_key("rakurai_warning"));
-        assert!(grouped.contains_key("rakurai_status"));
+    fn test_unknown_table_not_allowed() {
+        assert!(!ALLOWED_TABLES.contains(&"rakurai_write_grant_probe"));
+        assert!(ALLOWED_TABLES.contains(&"rakurai_warning"));
     }
 
+    /// Live end-to-end smoke: official client + TLS verify + insert all allowlisted tables.
+    ///
+    /// `ch_writer` is INSERT-only; SELECT readback is best-effort (skipped on ACCESS_DENIED).
+    ///
+    /// Run with:
+    /// `CH_SMOKE_PASSWORD=... cargo test -p solana-metrics --features agave-unstable-api --lib \
+    ///    smoke_live_clickhouse_all_tables -- --ignored --nocapture`
     #[test]
-    fn test_create_table_ddl_for_allowlisted_tables() {
-        for table in ALLOWED_TABLES {
-            let ddl = create_table_ddl(table).expect(table);
-            assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS "), "{table}");
-            assert!(ddl.contains("`timestamp` DateTime64(9, 'UTC')"), "{table}");
-            assert!(ddl.contains("`time_ns` UInt64"), "{table}");
-            assert!(ddl.contains("`host_id` LowCardinality(String)"), "{table}");
-            assert!(ddl.contains("ENGINE = MergeTree"), "{table}");
-        }
-        assert!(create_table_ddl("rakurai_unknown").is_none());
-    }
+    #[ignore = "live ClickHouse network smoke"]
+    fn smoke_live_clickhouse_all_tables() {
+        let host = std::env::var("CH_SMOKE_HOST")
+            .unwrap_or_else(|_| "https://metrics.rakurai.io:8443".to_string());
+        let db = std::env::var("CH_SMOKE_DB").unwrap_or_else(|_| "rakurai_stats_db".to_string());
+        let user = std::env::var("CH_SMOKE_USER").unwrap_or_else(|_| "ch_writer".to_string());
+        let password = std::env::var("CH_SMOKE_PASSWORD")
+            .expect("set CH_SMOKE_PASSWORD to run live ClickHouse smoke");
 
-    #[test]
-    fn test_bundle_lifecycle_ddl_includes_indexes_and_projection() {
-        let ddl = create_table_ddl("rakurai_info_bundle_lifecycle").expect("ddl");
-        assert!(ddl.contains(
-            "INDEX idx_bundle_id bundle_id TYPE bloom_filter(0.01) GRANULARITY 4"
-        ));
-        assert!(ddl.contains(
-            "INDEX idx_signatures_ngram ifNull(signatures, '') TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4"
-        ));
-        assert!(ddl.contains("PROJECTION proj_by_timestamp"));
-        assert!(ddl.contains("timestamp,"));
-        assert!(ddl.contains("host_id"));
-        // Table ORDER BY stays (host_id, timestamp); projection is for timestamp-first reads.
-        assert!(ddl.contains("ORDER BY (host_id, timestamp)"));
+        let marker = format!(
+            "crate-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+
+        let client = build_client(&host, &db, &user, &password);
+
+        let mut bundle_dp = DataPoint::new("rakurai_info_bundle_lifecycle");
+        bundle_dp.add_field_str("bundle_id", &marker);
+        bundle_dp.add_field_i64("num_txs", 1);
+        bundle_dp.add_field_str("outcome", "smoke");
+
+        let mut tin_dp = DataPoint::new("rakurai_tin_connection_state");
+        tin_dp.add_field_bool("primary", true);
+        tin_dp.add_field_str("state", "smoke");
+        tin_dp.add_field_str("source", &marker);
+        tin_dp.add_field_str("url", "https://smoke.example/configured");
+        tin_dp.add_field_str("actual_url", "https://smoke.example/resolved");
+        tin_dp.add_field_str("uuid", &marker);
+
+        let mut warning_dp = DataPoint::new("rakurai_warning");
+        warning_dp.add_field_str("rakurai_abort_log", &marker);
+
+        let mut info_dp = DataPoint::new("rakurai_info");
+        info_dp.add_field_str("rakurai_info_log", &marker);
+
+        let mut status_dp = DataPoint::new("rakurai_status");
+        status_dp.add_field_bool("enabled", true);
+
+        let mut qos_tp_dp = DataPoint::new("rakurai_scheduler_qos_throughput");
+        qos_tp_dp.add_field_i64("ordinary_transaction_count", 1);
+
+        let mut qos_worker_dp = DataPoint::new("rakurai_scheduler_qos_worker");
+        qos_worker_dp.add_field_i64("worker", 0);
+        qos_worker_dp.add_field_i64("transactions", 1);
+
+        let points = [
+            bundle_dp,
+            tin_dp,
+            warning_dp,
+            info_dp,
+            status_dp,
+            qos_tp_dp,
+            qos_worker_dp,
+        ];
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let one: u8 = client
+                .query("SELECT 1")
+                .fetch_one()
+                .await
+                .expect("SELECT 1 over verified TLS failed");
+            assert_eq!(one, 1, "ClickHouse SELECT 1");
+            eprintln!("OK SELECT 1 (verified TLS)");
+
+            write_rakurai_points(&client, &points, &marker).await;
+            eprintln!("OK write_rakurai_points for all allowlisted tables");
+
+            match client
+                .query("SELECT count() FROM rakurai_info WHERE host_id = ?")
+                .bind(&marker)
+                .fetch_one::<u64>()
+                .await
+            {
+                Ok(n) => {
+                    assert!(n >= 1, "expected readback rows, got {n}");
+                    eprintln!("OK SELECT readback rakurai_info count={n}");
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("ACCESS_DENIED") || msg.contains("Not enough privileges"),
+                        "unexpected SELECT failure: {msg}"
+                    );
+                    eprintln!(
+                        "OK INSERT-only user (SELECT denied as expected): {}",
+                        msg.lines().next().unwrap_or(&msg)
+                    );
+                }
+            }
+        });
     }
 }

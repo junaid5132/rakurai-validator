@@ -119,17 +119,6 @@ pub fn execute(
     if matches.is_present("disable_rakurai_logs_db") {
         solana_metrics::set_rakurai_metrics_enabled(false);
     } else {
-        let password = matches
-            .value_of("rakurai_logs_db_password")
-            .unwrap_or("")
-            .to_string();
-        if password.is_empty() {
-            warn!(
-                "rakurai-logs-db-password is empty; Rakurai ClickHouse metrics writes will be \
-                 disabled until a password is provided via --rakurai-logs-db-password"
-            );
-        }
-        // ClickHouse HTTPS currently requires accepting the invalid/self-signed cert.
         solana_metrics::set_rakurai_metrics_config(
             matches
                 .value_of("rakurai_logs_db_host")
@@ -143,8 +132,10 @@ pub fn execute(
                 .value_of("rakurai_logs_db_user")
                 .expect("rakurai_logs_db_user has a default")
                 .to_string(),
-            password,
-            true,
+            matches
+                .value_of("rakurai_logs_db_password")
+                .expect("rakurai_logs_db_password has a default")
+                .to_string(),
         );
     }
 

@@ -20,19 +20,23 @@ name = "solana_metrics"
 [features]
 agave-unstable-api = []
 default = ["influxdb"]
-without_influxdb = []
-influxdb = ["reqwest"]
+# Enables InfluxDB (Solana) + ClickHouse (Rakurai) remote writers.
+# Use `--no-default-features` for a metrics agent that only buffers / local abort dumps.
+influxdb = ["dep:reqwest", "dep:clickhouse", "dep:chrono", "dep:tokio", "dep:serde"]
 
 [dependencies]
+chrono = { workspace = true, optional = true, default-features = false, features = ["clock"] }
+clickhouse = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 gethostname = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"], optional = true }
+serde = { workspace = true, optional = true }
 solana-cluster-type = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 solana-time-utils = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["rt", "macros", "time"] }
 
 [dev-dependencies]
 bencher = { workspace = true }
@@ -41,6 +45,7 @@ rand = { workspace = true }
 serial_test = { workspace = true }
 solana-metrics = { path = ".", features = ["agave-unstable-api"] }
 solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [[bench]]
 name = "metrics"

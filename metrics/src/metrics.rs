@@ -3,10 +3,10 @@
 
 use std::{fs::OpenOptions, io::Write as io_write};
 
-#[cfg(not(feature = "without_influxdb"))]
-use crate::clickhouse::{self, RakuraiClickHouseConfig};
+#[cfg(feature = "influxdb")]
+use crate::clickhouse;
 use crate::create_datapoint;
-#[cfg(not(feature = "without_influxdb"))]
+#[cfg(feature = "influxdb")]
 use reqwest;
 
 use {
@@ -60,14 +60,12 @@ pub fn set_rakurai_metrics_config(
     db: String,
     username: String,
     password: String,
-    insecure_tls: bool,
 ) {
     *RAKURAI_METRICS_CONFIG.write().unwrap() = RakuraiMetricsConfig {
         host,
         db,
         username,
         password,
-        insecure_tls,
     };
 }
 
@@ -77,7 +75,7 @@ type CounterMap = HashMap<(&'static str, u64), CounterPoint>;
 pub enum MetricsError {
     #[error(transparent)]
     VarError(#[from] env::VarError),
-    #[cfg(not(feature = "without_influxdb"))]
+    #[cfg(feature = "influxdb")]
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
     #[error("SOLANA_METRICS_CONFIG is invalid: '{0}'")]
@@ -116,23 +114,27 @@ pub struct MetricsAgent {
     sender: Sender<MetricsCommand>,
 }
 
-#[cfg(not(feature = "without_influxdb"))]
+/// Called on the internal MetricsAgent worker thread.
 pub trait MetricsWriter {
-    // Write the points and empty the vector.  Called on the internal
-    // MetricsAgent worker thread.
-    fn write(&self, client: &reqwest::blocking::Client, points: Vec<DataPoint>);
-}
-
-#[cfg(feature = "without_influxdb")]
-pub trait MetricsWriter {
-    fn write(&self, _points: Vec<DataPoint>);
+    fn write(&self, points: Vec<DataPoint>);
 }
 
 struct InfluxDbMetricsWriter {
+    #[cfg(feature = "influxdb")]
     write_url: Option<String>,
+    #[cfg(feature = "influxdb")]
     extra_stats_write_url: Option<String>,
-    #[cfg(not(feature = "without_influxdb"))]
-    rakurai_clickhouse_client: Option<reqwest::blocking::Client>,
+    #[cfg(feature = "influxdb")]
+    http_client: reqwest::blocking::Client,
+    #[cfg(feature = "influxdb")]
+    rakurai_clickhouse: Option<RakuraiClickHouseWriter>,
+}
+
+/// Official ClickHouse client + sync bridge for the metrics agent thread.
+#[cfg(feature = "influxdb")]
+struct RakuraiClickHouseWriter {
+    client: clickhouse::Client,
+    runtime: Mutex<tokio::runtime::Runtime>,
 }
 
 #[allow(dead_code)]
@@ -168,29 +170,48 @@ impl InfluxDbMetricsWriter {
         let rakurai_config = get_rakurai_metrics_config().ok();
         if let Some(ref config) = rakurai_config {
             info!(
-                "rakurai metrics configuration: host={} db={} username={} backend=clickhouse \
-                 insecure_tls={}",
-                config.host, config.db, config.username, config.insecure_tls
+                "rakurai metrics configuration: host={} db={} username={} backend=clickhouse",
+                config.host, config.db, config.username
             );
         }
-        #[cfg(not(feature = "without_influxdb"))]
-        let rakurai_clickhouse_client = rakurai_config.and_then(|config| {
-            clickhouse::build_client(config.insecure_tls)
+        #[cfg(feature = "influxdb")]
+        let rakurai_clickhouse: Option<RakuraiClickHouseWriter> = rakurai_config.and_then(|config| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .map_err(|err| {
-                    warn!("rakurai ClickHouse client init failed: {err}");
+                    warn!("rakurai ClickHouse runtime init failed: {err}");
                     err
                 })
-                .ok()
+                .ok()?;
+            let client = clickhouse::build_client(
+                &config.host,
+                &config.db,
+                &config.username,
+                &config.password,
+            );
+            Some(RakuraiClickHouseWriter {
+                client,
+                runtime: Mutex::new(runtime),
+            })
         });
 
         Self {
+            #[cfg(feature = "influxdb")]
             write_url: Self::build_write_url().ok(),
+            #[cfg(feature = "influxdb")]
             extra_stats_write_url: Self::build_extra_stats_write_url().ok(),
-            #[cfg(not(feature = "without_influxdb"))]
-            rakurai_clickhouse_client,
+            #[cfg(feature = "influxdb")]
+            http_client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("metrics http client successfully instantiated"),
+            #[cfg(feature = "influxdb")]
+            rakurai_clickhouse,
         }
     }
 
+    #[cfg(feature = "influxdb")]
     fn build_write_url() -> Result<String, MetricsError> {
         let config = get_metrics_config().map_err(|err| {
             info!("metrics disabled: {err}");
@@ -211,6 +232,7 @@ impl InfluxDbMetricsWriter {
     }
 
     // copy of build_write_url with different db name
+    #[cfg(feature = "influxdb")]
     fn build_extra_stats_write_url() -> Result<String, MetricsError> {
         let config = get_metrics_config().map_err(|err| {
             info!("metrics disabled: {}", err);
@@ -262,20 +284,12 @@ fn serialize_into_string(line: &mut String, point: &DataPoint, host_id: &str) {
     let _ = writeln!(line, " {nanos}");
 }
 
-pub fn serialize_points(
-    points: &Vec<DataPoint>,
-    host_id: &str,
-) -> (String, Option<String>, Option<String>, bool) {
+pub fn serialize_points(points: &Vec<DataPoint>, host_id: &str) -> (String, Option<String>) {
     let mut len = 0;
     let mut extra_stats_log_len = 0;
-    let mut rakurai_log_len = 0;
-    let mut rakurai_warning_log = false;
     for point in points {
         if point.name.starts_with("rakurai") {
-            if point.name.contains("rakurai_warning") {
-                rakurai_warning_log = true;
-            }
-            calculate_len(&mut rakurai_log_len, point, host_id);
+            continue;
         } else if point.name.contains("extra_stats") {
             calculate_len(&mut extra_stats_log_len, point, host_id);
         } else {
@@ -285,10 +299,9 @@ pub fn serialize_points(
 
     let mut line = String::with_capacity(len);
     let mut extra_stats_log_line = String::with_capacity(extra_stats_log_len);
-    let mut rakurai_log_line = String::with_capacity(rakurai_log_len);
     for point in points {
         if point.name.starts_with("rakurai") {
-            serialize_into_string(&mut rakurai_log_line, point, host_id);
+            continue;
         } else if point.name.contains("extra_stats") {
             serialize_into_string(&mut extra_stats_log_line, point, host_id);
         } else {
@@ -300,32 +313,18 @@ pub fn serialize_points(
     } else {
         Some(extra_stats_log_line)
     };
-    let rakurai_log_line = if rakurai_log_len == 0 {
-        None
-    } else {
-        Some(rakurai_log_line)
-    };
 
-    (
-        line,
-        extra_stats_log_line,
-        rakurai_log_line,
-        rakurai_warning_log,
-    )
+    (line, extra_stats_log_line)
 }
 
-#[allow(dead_code)]
-#[cfg(feature = "without_influxdb")]
-fn send_datapoints_to_db(_write_url: &String, _line: String, _skip_warning: bool) {}
-
-#[cfg(not(feature = "without_influxdb"))]
+#[cfg(feature = "influxdb")]
 fn send_datapoints_to_db(
     client: &reqwest::blocking::Client,
-    write_url: &String,
+    write_url: &str,
     line: String,
     skip_warning: bool,
 ) {
-    let response = client.post(write_url.as_str()).body(line).send();
+    let response = client.post(write_url).body(line).send();
     if let Ok(resp) = response {
         let status = resp.status();
         if !status.is_success() {
@@ -336,61 +335,37 @@ fn send_datapoints_to_db(
                 warn!("submit response unsuccessful: {} {}", status, text,);
             }
         }
-    } else {
-        if !skip_warning {
-            warn!("submit error: {}", response.unwrap_err());
-        }
+    } else if !skip_warning {
+        warn!("submit error: {}", response.unwrap_err());
     }
 }
 
-#[cfg(feature = "without_influxdb")]
 impl MetricsWriter for InfluxDbMetricsWriter {
     fn write(&self, points: Vec<DataPoint>) {
         debug!("submitting {} points", points.len());
 
-        let host_id = HOST_ID.read().unwrap();
+        let host_id: std::sync::RwLockReadGuard<'_, String> = HOST_ID.read().unwrap();
 
-        let (line, extra_stats_log_line, rakurai_log_line, rakurai_warning_log) =
-            serialize_points(&points, &host_id);
+        #[cfg(feature = "influxdb")]
+        {
+            let (line, extra_stats_log_line) = serialize_points(&points, &host_id);
 
-        if let Some(ref write_url) = self.write_url {
-            send_datapoints_to_db(write_url, line, false);
-        }
-        if let Some(ref extra_stats_write_url) = self.extra_stats_write_url {
-            if let Some(extra_stats_log_line) = extra_stats_log_line {
-                send_datapoints_to_db(extra_stats_write_url, extra_stats_log_line, true);
+            if let Some(ref write_url) = self.write_url {
+                send_datapoints_to_db(&self.http_client, write_url, line, false);
+            }
+            if let Some(ref extra_stats_write_url) = self.extra_stats_write_url {
+                if let Some(extra_stats_log_line) = extra_stats_log_line {
+                    send_datapoints_to_db(
+                        &self.http_client,
+                        extra_stats_write_url,
+                        extra_stats_log_line,
+                        true,
+                    );
+                }
             }
         }
 
-        self.write_rakurai_points(&points, &host_id, rakurai_log_line, rakurai_warning_log);
-    }
-}
-
-#[cfg(not(feature = "without_influxdb"))]
-impl MetricsWriter for InfluxDbMetricsWriter {
-    fn write(&self, client: &reqwest::blocking::Client, points: Vec<DataPoint>) {
-        debug!("submitting {} points", points.len());
-
-        let host_id = HOST_ID.read().unwrap();
-
-        let (line, extra_stats_log_line, rakurai_log_line, rakurai_warning_log) =
-            serialize_points(&points, &host_id);
-
-        if let Some(ref write_url) = self.write_url {
-            send_datapoints_to_db(client, write_url, line, false);
-        }
-        if let Some(ref extra_stats_write_url) = self.extra_stats_write_url {
-            if let Some(extra_stats_log_line) = extra_stats_log_line {
-                send_datapoints_to_db(client, extra_stats_write_url, extra_stats_log_line, true);
-            }
-        }
-
-        self.write_rakurai_points(
-            &points,
-            &host_id,
-            rakurai_log_line,
-            rakurai_warning_log,
-        );
+        self.write_rakurai_points(&points, &host_id);
     }
 }
 
@@ -398,70 +373,43 @@ impl InfluxDbMetricsWriter {
     fn write_rakurai_points(
         &self,
         points: &[DataPoint],
-        #[cfg_attr(feature = "without_influxdb", allow(unused_variables))] host_id: &str,
-        rakurai_log_line: Option<String>,
-        rakurai_warning_log: bool,
+        #[cfg_attr(not(feature = "influxdb"), allow(unused_variables))] host_id: &str,
     ) {
         let has_rakurai = points.iter().any(|p| p.name.starts_with("rakurai"));
         if !has_rakurai {
             return;
         }
 
-        // Local abort log must succeed independently of ClickHouse availability.
-        if rakurai_warning_log {
-            if let Some(line) = rakurai_log_line {
-                dump_to_file(line);
+        // Local abort dump must succeed independently of ClickHouse availability.
+        for point in points.iter().filter(|p| p.name == "rakurai_warning") {
+            for (name, value) in &point.fields {
+                if *name == "rakurai_abort_log" || *name == "rakurai_warning_log" {
+                    dump_to_file(crate::datapoint::decode_field_str(value));
+                }
             }
         }
 
-        // ClickHouse HTTP path is only available with the default `influxdb` feature
-        // (reqwest). Builds with `without_influxdb` still keep the local abort dump above.
-        #[cfg(not(feature = "without_influxdb"))]
+        #[cfg(feature = "influxdb")]
         {
-            let rakurai_points: Vec<DataPoint> = points
-                .iter()
-                .filter(|p| p.name.starts_with("rakurai"))
-                .cloned()
-                .collect();
-
-            let Ok(config) = get_rakurai_metrics_config() else {
-                // Disabled or incomplete — do not spam; config is set once at startup.
-                return;
-            };
-
-            let Some(ref ch_client) = self.rakurai_clickhouse_client else {
-                // Client build failed at agent start; warn once so ops can see metrics are dropped.
+            let Some(ref writer) = self.rakurai_clickhouse else {
                 static CLIENT_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
                 if !CLIENT_MISSING_WARNED.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "rakurai ClickHouse HTTP client unavailable; dropping rakurai metrics writes \
-                         (host={} db={})",
-                        config.host, config.db
-                    );
+                    warn!("rakurai ClickHouse client unavailable; dropping rakurai metrics writes");
                 }
                 return;
             };
 
-            let ch_config = RakuraiClickHouseConfig {
-                host: config.host,
-                db: config.db,
-                username: config.username,
-                password: config.password,
-            };
-
-            // Isolate ClickHouse failures from the metrics agent thread (and thus the validator).
-            let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                clickhouse::write_rakurai_points(ch_client, &ch_config, &rakurai_points, host_id);
-            }));
-            if let Err(panic_payload) = write_result {
-                warn!(
-                    "rakurai ClickHouse write panicked (suppressed): {:?}",
-                    panic_payload
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("unknown panic")
-                );
+            match writer.runtime.lock() {
+                Ok(runtime) => {
+                    runtime.block_on(clickhouse::write_rakurai_points(
+                        &writer.client,
+                        points,
+                        host_id,
+                    ));
+                }
+                Err(_) => {
+                    warn!("rakurai ClickHouse runtime lock poisoned; dropping write");
+                }
             }
         }
     }
@@ -556,38 +504,6 @@ impl MetricsAgent {
     //
     // Returns an updated value for `last_write_time`.  Which is equal to `Instant::now()`, just
     // before `write` in updated.
-    #[allow(unused)]
-    #[cfg(not(feature = "without_influxdb"))]
-    fn write(
-        client: &reqwest::blocking::Client,
-        writer: &Arc<dyn MetricsWriter + Send + Sync>,
-        max_points: usize,
-        max_points_per_sec: usize,
-        last_write_time: Instant,
-        points_buffered: usize,
-        points: &mut Vec<DataPoint>,
-        counters: &mut CounterMap,
-    ) -> Instant {
-        let now = Instant::now();
-        let secs_since_last_write = now.duration_since(last_write_time).as_secs();
-
-        writer.write(
-            client,
-            Self::combine_points(
-                max_points,
-                max_points_per_sec,
-                secs_since_last_write,
-                points_buffered,
-                points,
-                counters,
-            ),
-        );
-        now
-    }
-
-    #[allow(unused)]
-    #[cfg(feature = "without_influxdb")]
-    #[allow(dead_code)]
     fn write(
         writer: &Arc<dyn MetricsWriter + Send + Sync>,
         max_points: usize,
@@ -608,11 +524,9 @@ impl MetricsAgent {
             points,
             counters,
         ));
-
         now
     }
 
-    #[allow(unused_variables)]
     fn run(
         receiver: &Receiver<MetricsCommand>,
         writer: &Arc<dyn MetricsWriter + Send + Sync>,
@@ -620,64 +534,26 @@ impl MetricsAgent {
         max_points_per_sec: usize,
     ) {
         trace!("run: enter");
-        #[allow(unused_mut)]
         let mut last_write_time = Instant::now();
         let mut points = Vec::<DataPoint>::new();
         let mut counters = CounterMap::new();
 
-        #[allow(unused_variables)]
         let max_points = write_frequency.as_secs() as usize * max_points_per_sec;
-
-        // Bind common arguments in the `Self::write()` call.
-        #[cfg(not(feature = "without_influxdb"))]
-        let write = |client: &reqwest::blocking::Client,
-                     last_write_time: Instant,
-                     points: &mut Vec<DataPoint>,
-                     counters: &mut CounterMap|
-         -> Instant {
-            #[cfg(not(feature = "without_influxdb"))]
-            {
-                Self::write(
-                    client,
-                    writer,
-                    max_points,
-                    max_points_per_sec,
-                    last_write_time,
-                    receiver.len(),
-                    points,
-                    counters,
-                )
-            }
-            #[cfg(feature = "without_influxdb")]
-            {
-                Self::write(
-                    writer,
-                    max_points,
-                    max_points_per_sec,
-                    last_write_time,
-                    receiver.len(),
-                    points,
-                    counters,
-                )
-            }
-        };
-
-        #[cfg(not(feature = "without_influxdb"))]
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("metrics http client successfully instantiated");
 
         loop {
             match receiver.try_recv() {
                 Ok(cmd) => match cmd {
                     MetricsCommand::Flush(barrier) => {
                         debug!("metrics_thread: flush");
-                        #[cfg(not(feature = "without_influxdb"))]
-                        {
-                            last_write_time =
-                                write(&client, last_write_time, &mut points, &mut counters);
-                        }
+                        last_write_time = Self::write(
+                            writer,
+                            max_points,
+                            max_points_per_sec,
+                            last_write_time,
+                            receiver.len(),
+                            &mut points,
+                            &mut counters,
+                        );
                         barrier.wait();
                     }
                     MetricsCommand::Submit(point, level) => {
@@ -705,10 +581,15 @@ impl MetricsAgent {
 
             let now = Instant::now();
             if now.duration_since(last_write_time) >= write_frequency {
-                #[cfg(not(feature = "without_influxdb"))]
-                {
-                    last_write_time = write(&client, last_write_time, &mut points, &mut counters);
-                }
+                last_write_time = Self::write(
+                    writer,
+                    max_points,
+                    max_points_per_sec,
+                    last_write_time,
+                    receiver.len(),
+                    &mut points,
+                    &mut counters,
+                );
             }
         }
 
@@ -800,15 +681,6 @@ struct MetricsConfig {
     pub password: String,
 }
 
-#[derive(Clone, Debug, Default)]
-struct RakuraiMetricsConfig {
-    pub host: String,
-    pub db: String,
-    pub username: String,
-    pub password: String,
-    pub insecure_tls: bool,
-}
-
 impl MetricsConfig {
     fn complete(&self) -> bool {
         !(self.host.is_empty()
@@ -818,14 +690,9 @@ impl MetricsConfig {
     }
 }
 
-impl RakuraiMetricsConfig {
-    fn complete(&self) -> bool {
-        !(self.host.is_empty()
-            || self.db.is_empty()
-            || self.username.is_empty()
-            || self.password.is_empty())
-    }
-}
+/// Same shape as [`MetricsConfig`]; held separately so Solana Influx and Rakurai
+/// ClickHouse credentials stay independent.
+type RakuraiMetricsConfig = MetricsConfig;
 
 fn get_metrics_config() -> Result<MetricsConfig, MetricsError> {
     let mut config = MetricsConfig::default();
@@ -885,7 +752,7 @@ pub fn metrics_config_sanity_check(cluster_type: ClusterType) -> Result<(), Metr
     Err(MetricsError::DbMismatch(msg))
 }
 
-#[cfg(not(feature = "without_influxdb"))]
+#[cfg(feature = "influxdb")]
 pub fn query(q: &str) -> Result<String, MetricsError> {
     let config = get_metrics_config()?;
     let query_url = format!(
@@ -898,7 +765,7 @@ pub fn query(q: &str) -> Result<String, MetricsError> {
     Ok(response)
 }
 
-#[cfg(feature = "without_influxdb")]
+#[cfg(not(feature = "influxdb"))]
 pub fn query(_q: &str) -> Result<String, MetricsError> {
     Err(MetricsError::ConfigIncomplete)
 }
@@ -967,23 +834,6 @@ pub mod test_mocks {
         }
     }
 
-    #[cfg(not(feature = "without_influxdb"))]
-    impl MetricsWriter for MockMetricsWriter {
-        fn write(&self, _client: &reqwest::blocking::Client, points: Vec<DataPoint>) {
-            assert!(!points.is_empty());
-
-            let new_points = points.len();
-            self.points_written.lock().unwrap().extend(points);
-
-            info!(
-                "Writing {} points ({} total)",
-                new_points,
-                self.points_written(),
-            );
-        }
-    }
-
-    #[cfg(feature = "without_influxdb")]
     impl MetricsWriter for MockMetricsWriter {
         fn write(&self, points: Vec<DataPoint>) {
             assert!(!points.is_empty());
@@ -1179,11 +1029,10 @@ mod test {
             "rakurai_stats_db".to_string(),
             "ch_writer".to_string(),
             "secret".to_string(),
-            true,
         );
         let config = get_rakurai_metrics_config().unwrap();
         assert_eq!(config.host, "https://example:8443");
         assert_eq!(config.db, "rakurai_stats_db");
-        assert!(config.insecure_tls);
+        assert_eq!(config.username, "ch_writer");
     }
 }
